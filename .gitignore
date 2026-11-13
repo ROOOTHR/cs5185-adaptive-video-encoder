@@ -1,0 +1,24 @@
+# 虚拟环境与缓存
+.venv/
+.pip-cache/
+__pycache__/
+*.pyc
+
+# 数据集与编码产物（体积大，不入库）
+data/raw/
+data/out/
+data/out_baseline/
+data/out_v1_uncalibrated/
+
+# x264 两遍编码的中间日志
+*.log
+*.log.mbtree
+x264_2pass.log*
+
+# 诊断脚本的临时产物
+_diag/*.mp4
+_diag/*.txt
+
+# 编辑器
+.idea/
+.vscode/
