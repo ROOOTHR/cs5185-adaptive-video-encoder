@@ -12,6 +12,7 @@ import numpy as np
 
 from . import config, experiment, features, metadata
 from .encode import _exe
+from .ms_ssim import compare_videos
 
 
 def _read(path: Path) -> list[dict]:
@@ -80,19 +81,33 @@ def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
         for ratio in config.RATIOS:
             adaptive = by_key.get((vid, ratio, "A"))
             baseline = by_key.get((vid, ratio, "B0"))
-            if not adaptive or not baseline or adaptive.get("status") != "ok" or baseline.get("status") != "ok":
-                for category in ("运动流畅度", "模糊", "块效应", "重影", "细节损失"):
+            if not adaptive or not baseline or not adaptive.get("output_path") or not baseline.get("output_path"):
+                for category in ("\u8fd0\u52a8\u6d41\u7545\u5ea6", "\u6a21\u7cca", "\u5757\u6548\u5e94", "\u91cd\u5f71", "\u7ec6\u8282\u635f\u5931"):
                     notes.append({"video_id": vid, "ratio": ratio, "category": category,
-                                  "observation": "未确认：B0/A 未同时通过硬性验收", "frame": "", "region": ""})
+                                  "observation": "\u672a\u786e\u8ba4\uff1a\u7f3a\u5c11\u53ef\u89e3\u7801\u7684 B0/A \u8f93\u51fa", "frame": "", "region": ""})
                 continue
-            perframe_path = run / "perframe" / f"{vid}_A_{int(ratio*100):02d}pct.json"
-            perframe = json.loads(perframe_path.read_text(encoding="utf-8"))
-            quality = perframe["ms_ssim_per_frame"]
-            baseline_perframe_path = run / "perframe" / f"{vid}_B0_{int(ratio*100):02d}pct.json"
-            baseline_perframe = json.loads(baseline_perframe_path.read_text(encoding="utf-8"))
+            original_path = str(config.RAW_DIR / meta["file"])
+            perframe_data = {}
+            for group, result in (("A", adaptive), ("B0", baseline)):
+                perframe_path = run / "perframe" / f"{vid}_{group}_{int(ratio*100):02d}pct.json"
+                if perframe_path.is_file():
+                    perframe_data[group] = json.loads(perframe_path.read_text(encoding="utf-8"))
+                else:
+                    measured = compare_videos(original_path, result["output_path"],
+                                              meta["width"], meta["height"], meta["frames"])
+                    if not measured["ok"]:
+                        raise RuntimeError(f"cannot prepare diagnostic frames for {vid} {ratio:.0%} {group}: {measured['reason']}")
+                    perframe_data[group] = measured
+                    perframe_path.write_text(json.dumps({
+                        "video_id": vid, "group": group, "ratio": ratio,
+                        "frame_count": measured["frames_compared"],
+                        "selected_attempt": result.get("selected_attempt"),
+                        "ms_ssim_per_frame": measured["ms_ssim_per_frame"],
+                        "psnr_y_per_frame": measured["psnr_y_per_frame"]}, allow_nan=True), encoding="utf-8")
+            quality = perframe_data["A"]["ms_ssim_per_frame"]
+            baseline_perframe = perframe_data["B0"]
             low_frame = int(np.argmin(quality))
             edge_peak = int(np.argmax(feat["per_frame"]["edge_ratio"]))
-            original_path = str(config.RAW_DIR / meta["file"])
             if edge_peak == low_frame:
                 edge_values = np.asarray(feat["per_frame"]["edge_ratio"], dtype=float)
                 edge_peak = int(np.argsort(edge_values)[-2])
@@ -126,17 +141,21 @@ def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
                          f"MS-SSIM dB B0/A: {_float(baseline, 'ms_ssim_db') or 0:.3f}/"
                          f"{_float(adaptive, 'ms_ssim_db') or 0:.3f} | frame MS-SSIM B0/A: "
                          f"{baseline_perframe['ms_ssim_per_frame'][index]:.5f}/"
-                         f"{perframe['ms_ssim_per_frame'][index]:.5f}")
+                         f"{perframe_data['A']['ms_ssim_per_frame'][index]:.5f}" +
+                         (" | DIAGNOSTIC ONLY: A failed acceptance" if adaptive.get("status") != "ok" else ""))
+                if adaptive.get("status") != "ok":
+                    axes[2].set_title("A - FAILED ACCEPTANCE")
                 fig.suptitle(title, fontsize=9)
                 fig.tight_layout()
                 suffix = "lowest_msssim" if index == low_frame else "edge_peak"
                 fig.savefig(frames_dir / f"{vid}_{int(ratio*100):02d}pct_{suffix}.png", dpi=150)
                 plt.close(fig)
                 region = f"x={x},y={y},size={size}x{size}"
-                for category in ("運動流暢度", "模糊", "塊效應", "重影", "細節損失"):
+                status_note = ("\u672a\u786e\u8ba4\uff1a\u9700\u4eba\u5de5\u590d\u6838" if adaptive.get("status") == "ok"
+                               else f"\u8bca\u65ad\u753b\u9762\uff1bA\u672a\u901a\u8fc7\u9a8c\u6536 (size_error={_float(adaptive, 'size_error'):+.4%})\uff0c\u4e0d\u8ba1\u5165\u6b63\u5f0f\u6bd4\u8f83")
+                for category in ("\u8fd0\u52a8\u6d41\u7545\u5ea6", "\u6a21\u7cca", "\u5757\u6548\u5e94", "\u91cd\u5f71", "\u7ec6\u8282\u635f\u5931"):
                     notes.append({"video_id": vid, "ratio": ratio, "category": category,
-                                  "observation": "未確認：需逐像素/播放主觀复核",
-                                  "frame": index, "region": region})
+                                  "observation": status_note, "frame": index, "region": region})
             clip = clips / f"{vid}_{int(ratio*100):02d}pct_B0_vs_A.mp4"
             command = [ff, "-y", "-i", original_path, "-i", baseline["output_path"],
                        "-i", adaptive["output_path"], "-filter_complex",
@@ -145,7 +164,10 @@ def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
                        "-c:v", "libx264", "-threads", str(config.ENCODE_THREADS),
                        "-preset", "medium", "-crf", "23", str(clip)]
             subprocess.run(command, check=True, capture_output=True)
-    _write(run / "subjective_notes.csv", notes)
+    notes_path = run / "subjective_notes.csv"
+    if notes_path.exists():
+        return _read(notes_path)  # A report rebuild must not replace reviewed observations.
+    _write(notes_path, notes)
     return notes
 
 
@@ -367,7 +389,7 @@ def _html(run: Path, rows: list[dict]) -> None:
                "size_error", "psnr_y_db", "ms_ssim", "ms_ssim_db", "decode_ok", "frame_count", "output_path")
     html_rows = []
     for row in rows:
-        color = ' style="background:#ffd9d9"' if _float(row, "size_error") is not None and _float(row, "size_error") > 0 else ""
+        color = ' style="background:#ffd9d9"' if row.get("status") != "ok" or (_float(row, "size_error") is not None and _float(row, "size_error") > 0) else ""
         html_rows.append(f"<tr{color}>" + "".join(f"<td>{esc(row.get(k))}</td>" for k in visible) +
                          '<td><a href="attempts.jsonl#L1">attempts</a></td></tr>')
     links = [f'<li><a href="{name}">{name}</a></li>' for name in (
@@ -380,7 +402,16 @@ def _html(run: Path, rows: list[dict]) -> None:
             if path.suffix == ".png":
                 assets.append(f'<figure><a href="{esc(rel)}"><img loading="lazy" src="{esc(rel)}" style="max-width:100%"></a><figcaption>{esc(path.name)}</figcaption></figure>')
             elif path.suffix == ".mp4":
-                assets.append(f'<figure><video controls preload="none" src="{esc(rel)}"></video><figcaption>{esc(path.name)}</figcaption></figure>')
+                caption = path.name
+                if folder == "clips":
+                    prefix = path.stem.removesuffix("_B0_vs_A")
+                    video_id, budget = prefix.rsplit("_", 1)
+                    failed = next((row for row in rows if row["video_id"] == video_id and
+                                   int(float(row["target_ratio"]) * 100) == int(budget[:2]) and
+                                   row["group"] == "A" and row.get("status") != "ok"), None)
+                    if failed:
+                        caption += f' — DIAGNOSTIC ONLY: A failed acceptance ({_float(failed, "size_error"):+.3%})'
+                assets.append(f'<figure><video controls preload="none" src="{esc(rel)}"></video><figcaption>{esc(caption)}</figcaption></figure>')
     table_head = "".join(f"<th>{esc(key)}</th>" for key in visible) + "<th>log</th>"
     document = ("<!doctype html><meta charset=utf-8><title>CS5185 v2 results</title>"
         "<style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;font-size:11px}td,th{border:1px solid #ccc;padding:4px}figure{margin:1rem 0}video{max-width:100%}</style>"
