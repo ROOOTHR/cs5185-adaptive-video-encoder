@@ -68,7 +68,7 @@ def _choose_region(original, b0, adaptive):
     return gx * step, gy * step, patch
 
 
-def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
+def _comparison_materials(run: Path, rows: list[dict], *, render_clips: bool = True) -> list[dict]:
     by_key = {(r["video_id"], float(r["ratio"]), r["group"]): r for r in rows}
     notes, clips = [], run / "clips"
     clips.mkdir(exist_ok=True)
@@ -120,18 +120,18 @@ def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
-                fig, axes = plt.subplots(1, 4, figsize=(18, 4.3))
+                fig, (views, crops) = plt.subplots(2, 3, figsize=(13, 6), height_ratios=(1.5, 1))
                 from matplotlib.patches import Rectangle
-                for ax, image, label in zip(axes[:3], (original, b0, adaptive_frame),
-                                            ("Original", "B0", "A")):
+                for ax, zoom, image, label in zip(views, crops, (original, b0, adaptive_frame),
+                                                  ("Original", "B0", "A")):
                     ax.imshow(image)
                     ax.add_patch(Rectangle((x, y), size, size, fill=False, edgecolor="yellow", linewidth=1.5))
                     ax.set_title(label)
                     ax.axis("off")
-                crop = adaptive_frame[y:y+size, x:x+size]
-                axes[3].imshow(cv2.resize(crop, (size*2, size*2), interpolation=cv2.INTER_NEAREST))
-                axes[3].set_title(f"A crop 2x ({x},{y})")
-                axes[3].axis("off")
+                    crop = image[y:y+size, x:x+size]
+                    zoom.imshow(cv2.resize(crop, (size*2, size*2), interpolation=cv2.INTER_NEAREST), interpolation="nearest")
+                    zoom.set_title(f"{label} crop 2x ({x},{y})")
+                    zoom.axis("off")
                 fps = meta["fps"]
                 title = (f"{vid} {ratio:.0%} | frame {index} @ {index/fps:.3f}s | "
                          f"file kbps B0/A: {_float(baseline, 'file_kbps') or 0:.0f}/"
@@ -144,7 +144,7 @@ def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
                          f"{perframe_data['A']['ms_ssim_per_frame'][index]:.5f}" +
                          (" | DIAGNOSTIC ONLY: A failed acceptance" if adaptive.get("status") != "ok" else ""))
                 if adaptive.get("status") != "ok":
-                    axes[2].set_title("A - FAILED ACCEPTANCE")
+                    views[2].set_title("A - FAILED ACCEPTANCE")
                 fig.suptitle(title, fontsize=9)
                 fig.tight_layout()
                 suffix = "lowest_msssim" if index == low_frame else "edge_peak"
@@ -156,6 +156,8 @@ def _comparison_materials(run: Path, rows: list[dict]) -> list[dict]:
                 for category in ("\u8fd0\u52a8\u6d41\u7545\u5ea6", "\u6a21\u7cca", "\u5757\u6548\u5e94", "\u91cd\u5f71", "\u7ec6\u8282\u635f\u5931"):
                     notes.append({"video_id": vid, "ratio": ratio, "category": category,
                                   "observation": status_note, "frame": index, "region": region})
+            if not render_clips:
+                continue
             clip = clips / f"{vid}_{int(ratio*100):02d}pct_B0_vs_A.mp4"
             command = [ff, "-y", "-i", original_path, "-i", baseline["output_path"],
                        "-i", adaptive["output_path"], "-filter_complex",
