@@ -88,7 +88,7 @@ def write_run_config(run_dir: Path, phase: str) -> dict:
                         "expected_video_sha256": expected, "matches_metadata": match}
         valid &= match
     packages = {}
-    for name in ("numpy", "opencv-python", "matplotlib", "imageio-ffmpeg",
+    for name in ("numpy", "opencv-python", "opencv-python-headless", "matplotlib", "imageio-ffmpeg",
                  "torch", "pytorch-msssim"):
         try:
             packages[name] = importlib.metadata.version(name)
@@ -101,7 +101,8 @@ def write_run_config(run_dir: Path, phase: str) -> dict:
         "git_status": status, "ffmpeg_version": ffmpeg_version,
         "cpu": platform.processor() or platform.machine(),
         "logical_cpus": os.cpu_count(), "encode_threads": config.ENCODE_THREADS,
-        "parallelism": 1, "python": sys.version, "packages": packages,
+        "parallelism": 1, "caching_policy": "OS filesystem cache defaults; no application-level cache",
+        "python": sys.version, "packages": packages,
         "decide_sha256": _sha(config.ROOT / "src" / "decide.py"),
         "dataset_root": str(config.RAW_DIR), "dataset_sha256_valid": bool(valid),
         "dataset_sha256": sources,
@@ -168,12 +169,16 @@ def _heatmap(rows: list[dict], metric: str, output: Path, title: str) -> None:
     candidates = ["anchor"] + [item[0] for item in _variant_rows()]
     keys = sorted({(r["video_id"], float(r["ratio"])) for r in rows})
     lookup = {(r["video_id"], float(r["ratio"]), r["candidate"]): r for r in rows}
-    anchor_values = {(vid, ratio): _num(lookup.get((vid, ratio, "anchor"), {}).get(metric)) for vid, ratio in keys}
+    def measured(key, candidate):
+        row = lookup.get((*key, candidate), {})
+        return _num(row.get(metric)) if row.get("status") == "ok" else None
+
+    anchor_values = {key: measured(key, "anchor") for key in keys}
     matrix = np.full((len(keys), len(candidates)), np.nan)
     for i, key in enumerate(keys):
         base = anchor_values[key]
         for j, cand in enumerate(candidates):
-            value = _num(lookup.get((*key, cand), {}).get(metric))
+            value = measured(key, cand)
             if value is not None and base is not None:
                 matrix[i, j] = value - base
     fig, ax = plt.subplots(figsize=(max(12, 0.65 * len(candidates)), max(6, 0.28 * len(keys))))
@@ -199,6 +204,27 @@ def _num(value):
         return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
+
+
+def _sweep_rows(summary_rows: list[dict]) -> list[dict]:
+    lookup = {(row["video_id"], float(row["ratio"]), row["candidate"]): row
+              for row in summary_rows}
+    rows = []
+    for source in summary_rows:
+        row = dict(source)
+        anchor = lookup.get((row["video_id"], float(row["ratio"]), "anchor"), {})
+        eligible = row.get("status") == "ok" and anchor.get("status") == "ok"
+        psnr = _num(row.get("psnr_y_db"))
+        anchor_psnr = _num(anchor.get("psnr_y_db"))
+        msssim = _num(row.get("ms_ssim_db"))
+        anchor_msssim = _num(anchor.get("ms_ssim_db"))
+        delta_psnr = psnr - anchor_psnr if eligible and psnr is not None and anchor_psnr is not None else None
+        delta_msssim = msssim - anchor_msssim if eligible and msssim is not None and anchor_msssim is not None else None
+        row.update(delta_psnr_y_db=delta_psnr, delta_ms_ssim_db=delta_msssim,
+                   significantly_better=bool(delta_msssim is not None and delta_psnr is not None and
+                       delta_msssim >= SIGNIFICANCE_MSSSIM_DB and delta_psnr >= SIGNIFICANCE_PSNR_DB))
+        rows.append(row)
+    return rows
 
 
 def _index(run_dir: Path, title: str) -> None:
@@ -249,17 +275,7 @@ def sweep(run_name: str) -> Path:
                 print(f"[{job_index}/{total_jobs}] {vid} {ratio:.0%} {candidate}", flush=True)
                 summary = pipeline.run_candidate(vid, ratio, candidate, params, feat, meta, run_dir)
                 summary_rows.append(_base_row(vid, ratio, candidate, dimension, value, feat, summary))
-    lookup = {(r["video_id"], float(r["ratio"]), r["candidate"]): r for r in summary_rows}
-    sweep_rows = []
-    for row in summary_rows:
-        key = (row["video_id"], float(row["ratio"]))
-        anchor = lookup.get((*key, "anchor"), {})
-        psnr_delta = _num(row.get("psnr_y_db")) - _num(anchor.get("psnr_y_db")) if _num(row.get("psnr_y_db")) is not None and _num(anchor.get("psnr_y_db")) is not None else None
-        ms_delta = _num(row.get("ms_ssim_db")) - _num(anchor.get("ms_ssim_db")) if _num(row.get("ms_ssim_db")) is not None and _num(anchor.get("ms_ssim_db")) is not None else None
-        row.update(delta_psnr_y_db=psnr_delta, delta_ms_ssim_db=ms_delta,
-                   significantly_better=bool(ms_delta is not None and psnr_delta is not None and
-                       ms_delta >= SIGNIFICANCE_MSSSIM_DB and psnr_delta >= SIGNIFICANCE_PSNR_DB))
-        sweep_rows.append(row)
+    sweep_rows = _sweep_rows(summary_rows)
     _write_csv(run_dir / "summary.csv", summary_rows)
     _write_csv(run_dir / "sweep_summary.csv", sweep_rows)
     figs = run_dir / "figs"
@@ -291,17 +307,18 @@ def derive_rules(rows: list[dict], max_rules: int = MAX_RULES) -> list[dict]:
     by_key = {(r["video_id"], float(r["ratio"]), r["candidate"]): r for r in rows}
     qualified = []
     for dimension in (x[1] for x in _variant_rows()):
-        if dimension in {x[1] for x in qualified}:
-            continue
         parameter = decide.PARAMETERS[dimension]
         settings = [(name, value) for name, dim, value, _ in _variant_rows() if dim == dimension]
         for candidate, value in settings:
             trials = [by_key.get((vid, ratio, candidate)) for vid, ratio in samples]
             anchors = [by_key.get((vid, ratio, "anchor")) for vid, ratio in samples]
-            if any(t is None or a is None or _num(t.get("ms_ssim_db")) is None or
-                   _num(a.get("ms_ssim_db")) is None or _num(t.get("psnr_y_db")) is None or
-                   _num(a.get("psnr_y_db")) is None for t, a in zip(trials, anchors)):
+            pairs = [(t, a) for t, a in zip(trials, anchors)
+                     if t is not None and a is not None and t.get("status") == "ok" and
+                     a.get("status") == "ok" and all(_num(row.get(metric)) is not None
+                         for row in (t, a) for metric in ("ms_ssim_db", "psnr_y_db"))]
+            if not pairs:
                 continue
+            trials, anchors = map(list, zip(*pairs))
             labels = [(float(t["ms_ssim_db"]) - float(a["ms_ssim_db"]) >= SIGNIFICANCE_MSSSIM_DB and
                        float(t["psnr_y_db"]) - float(a["psnr_y_db"]) >= SIGNIFICANCE_PSNR_DB)
                       for t, a in zip(trials, anchors)]
@@ -313,7 +330,8 @@ def derive_rules(rows: list[dict], max_rules: int = MAX_RULES) -> list[dict]:
                 if not separator:
                     continue
                 positive = sum(labels)
-                mean_delta = float(np.mean([float(t["delta_ms_ssim_db"]) for t, label in zip(trials, labels) if label]))
+                mean_delta = float(np.mean([float(t["ms_ssim_db"]) - float(a["ms_ssim_db"])
+                                            for t, a, label in zip(trials, anchors, labels) if label]))
                 qualified.append({"dimension": dimension, "feature": separator["feature"],
                     "operator": separator["operator"], "threshold": separator["threshold"],
                     "parameter": parameter, "value": value, "fallback": ANCHOR[parameter],
@@ -354,10 +372,15 @@ def derive(run_name: str) -> dict:
     run_dir = config.RUN_DIR / run_name
     if not run_dir.is_dir():
         raise FileNotFoundError(run_dir)
-    raw = _read_csv(run_dir / "sweep_summary.csv")
-    # Derivation consumes only DEV rows; the guard is repeated at the data boundary.
+    raw = _read_csv(run_dir / "summary.csv")
+    # Rebuild analytical deltas using only candidates that passed every integrity check.
     require_development_ids(sorted({row["video_id"] for row in raw}))
-    rules = derive_rules(raw)
+    sweep_rows = _sweep_rows(raw)
+    _write_csv(run_dir / "sweep_summary.csv", sweep_rows)
+    figs = run_dir / "figs"
+    _heatmap(sweep_rows, "ms_ssim_db", figs / "sweep_heatmap_msssim.png", "DEV sweep: ΔMS-SSIM(dB) from anchor")
+    _heatmap(sweep_rows, "psnr_y_db", figs / "sweep_heatmap_psnr.png", "DEV sweep: ΔPSNR-Y(dB) from anchor")
+    rules = derive_rules(sweep_rows)
     rules_path = config.ROOT / "src" / "rules_v2.json"
     rules_path.write_text(json.dumps({"pre_registered": {
         "metric": "delta_ms_ssim_db", "significance_ms_ssim_db": SIGNIFICANCE_MSSSIM_DB,
@@ -366,7 +389,7 @@ def derive(run_name: str) -> dict:
     _write_csv(run_dir / "rules.csv", rules)
     oracle_rows = []
     by_pair = {}
-    for row in raw:
+    for row in sweep_rows:
         if row["status"] == "ok" and _num(row.get("ms_ssim_db")) is not None:
             by_pair.setdefault((row["video_id"], float(row["ratio"])), []).append(row)
     for (vid, ratio), candidates in sorted(by_pair.items()):
@@ -377,7 +400,7 @@ def derive(run_name: str) -> dict:
                             "ms_ssim_db": oracle["ms_ssim_db"], "psnr_y_db": oracle["psnr_y_db"],
                             "size_error": oracle["size_error"], "output_path": oracle["output_path"]})
     _write_csv(run_dir / "oracle_summary.csv", oracle_rows)
-    _write_best_values_and_loocv(raw, run_dir, rules)
+    _write_best_values_and_loocv(sweep_rows, run_dir, rules)
     _index(run_dir, f"{run_name}: DEV scan and frozen derivation")
     return {"rules": rules, "path": rules_path}
 
@@ -393,7 +416,8 @@ def _write_best_values_and_loocv(rows: list[dict], run_dir: Path, full_rules: li
                 (name, dim, dict(ANCHOR, **overrides))
                 for name, dim, _, overrides in _variant_rows() if dim == dimension]
             available = [by_key[(vid, ratio, name)] for name, _, _ in candidates
-                         if (vid, ratio, name) in by_key and _num(by_key[(vid, ratio, name)].get("ms_ssim_db")) is not None]
+                         if (vid, ratio, name) in by_key and by_key[(vid, ratio, name)].get("status") == "ok" and
+                         _num(by_key[(vid, ratio, name)].get("ms_ssim_db")) is not None]
             if not available:
                 continue
             best = max(available, key=lambda row: (float(row["ms_ssim_db"]), float(row.get("psnr_y_db") or -1e9)))
@@ -409,7 +433,8 @@ def _write_best_values_and_loocv(rows: list[dict], run_dir: Path, full_rules: li
         train = [r for r in rows if r["video_id"] != held_out]
         require_development_ids({r["video_id"] for r in train})
         fold_rules = derive_rules(train)
-        for sample in (r for r in rows if r["video_id"] == held_out and r["candidate"] == "anchor"):
+        for sample in (r for r in rows if r["video_id"] == held_out and r["candidate"] == "anchor" and
+                       r.get("status") == "ok"):
             ratio = float(sample["ratio"])
             for dimension in dimensions:
                 parameter = decide.PARAMETERS[dimension]
@@ -417,7 +442,7 @@ def _write_best_values_and_loocv(rows: list[dict], run_dir: Path, full_rules: li
                 options = [(r, json.loads(r["parameters"]).get(parameter)) for r in rows
                            if r["video_id"] == held_out and float(r["ratio"]) == ratio and
                            (r["dimension"] == dimension or r["candidate"] == "anchor") and
-                           _num(r.get("ms_ssim_db")) is not None]
+                           r.get("status") == "ok" and _num(r.get("ms_ssim_db")) is not None]
                 if not options:
                     continue
                 oracle_row, oracle_value = max(options, key=lambda pair: (float(pair[0]["ms_ssim_db"]), float(pair[0].get("psnr_y_db") or -1e9)))
@@ -442,12 +467,15 @@ def _plot_best_values(rows: list[dict], figdir: Path) -> None:
         fig, axes = plt.subplots(2, 2, figsize=(10, 7))
         for ax, feature_name in zip(axes.ravel(), PRE_REGISTERED_FEATURES):
             x = [float(r[feature_name]) for r in subset]
-            y = [float(r["ms_ssim_db"]) for r in subset]
+            settings = sorted({r["best_value"] for r in subset})
+            setting_y = {value: index for index, value in enumerate(settings)}
+            y = [setting_y[r["best_value"]] for r in subset]
             ax.scatter(x, y, alpha=0.8)
             for row, xx, yy in zip(subset, x, y):
                 ax.annotate(f"{row['video_id'][-2:]} {float(row['ratio']):.0%}", (xx, yy), fontsize=6)
             ax.set_xlabel(feature_name)
-            ax.set_ylabel("oracle MS-SSIM (dB)")
+            ax.set_ylabel(f"best {dimension} setting")
+            ax.set_yticks(range(len(settings)), settings)
             ax.grid(alpha=0.2)
         fig.suptitle(f"DEV oracle setting vs pre-registered features: {dimension}")
         fig.tight_layout()
@@ -475,7 +503,8 @@ def validate(run_name: str, rules_path: Path | None = None) -> Path:
             bpp = bud["video_kbps"] * 1000 / (meta["width"] * meta["height"] * meta["fps"])
             for group in ("B1", "A"):
                 plan = decide.decide(feat, bud, group, rule_list, bpp)
-                result = pipeline.run_candidate(vid, ratio, group, plan["params"], feat, meta, run_dir)
+                result = pipeline.run_candidate(vid, ratio, group, plan["params"], feat, meta, run_dir,
+                                                reasons=plan["reasons"])
                 result.update(video_id=vid, ratio=ratio, group=group, reasons="; ".join(plan["reasons"]))
                 rows.append(result)
     paired = {(r["video_id"], float(r["target_ratio"]), r["group"]): r for r in rows}
@@ -491,7 +520,7 @@ def validate(run_name: str, rules_path: Path | None = None) -> Path:
 
 
 def final_guard() -> None:
-    tag = _git("rev-parse", "--verify", "refs/tags/frozen-v2", check=False)
+    tag = _git("rev-parse", "--verify", "refs/tags/frozen-v2^{commit}", check=False)
     if not tag:
         raise RuntimeError("final requires the frozen-v2 tag")
     if tag != _git("rev-parse", "HEAD"):
@@ -503,6 +532,7 @@ def final_guard() -> None:
 
 def final(run_name: str = "final_v2") -> Path:
     final_guard()
+    phase_started = time.perf_counter()
     run_dir = create_run(run_name)
     write_run_config(run_dir, "frozen final experiment")
     rule_list = _load_rules()
@@ -528,6 +558,11 @@ def final(run_name: str = "final_v2") -> Path:
                               reasons="; ".join(plan["reasons"]))
                 rows.append(result)
     _write_csv(run_dir / "summary.csv", rows)
+    elapsed = time.perf_counter() - phase_started
+    (run_dir / "phase_timing.json").write_text(json.dumps({
+        "formal_elapsed_s": elapsed, "serial": True,
+        "scope": "run setup, source feature extraction, metadata reads, every encode attempt and evaluation, and summary logging"
+    }, indent=2), encoding="utf-8")
     _index(run_dir, f"{run_name}: frozen final experiment")
     return run_dir
 
@@ -538,16 +573,19 @@ def alignment_check(sweep_run: str) -> Path:
         raise FileNotFoundError(source_run / "sweep_summary.csv")
     check_dir = config.CHECK_DIR / "msssim_alignment"
     check_dir.mkdir(parents=True, exist_ok=True)
-    import cv2
     rng = np.random.default_rng(5185)
-    reference = rng.integers(16, 240, size=(720, 1280), dtype=np.uint8)
+    selected = [("01_FourPeople", 0.05), ("02_Beauty", 0.05), ("03_Bosphorus", 0.05)]
+    first_meta = meta_mod.load_meta(selected[0][0])
+    _, first_frames = sample_y_frames(config.RAW_DIR / first_meta["file"], first_meta["width"],
+                                      first_meta["height"], first_meta["frames"], 1)
+    reference = first_frames[0]
     noise = rng.normal(0, 1, reference.shape)
     self_score = ms_ssim(reference, reference)
     noisy_scores = [ms_ssim(reference, np.clip(reference.astype(float) + noise * level, 0, 255).astype(np.uint8))
                     for level in (1, 2, 5, 10)]
     assert self_score == 1.0, f"self comparison is {self_score}"
-    assert all(a > b for a, b in zip([self_score] + noisy_scores, noisy_scores)), noisy_scores
-    selected = [("01_FourPeople", 0.05), ("02_Beauty", 0.05), ("03_Bosphorus", 0.05)]
+    strictly_monotonic = all(a > b for a, b in zip([self_score] + noisy_scores, noisy_scores))
+    assert strictly_monotonic, noisy_scores
     alignment_rows = []
     for vid, ratio in selected:
         summary_path = source_run / "summary.csv"
@@ -579,7 +617,7 @@ def alignment_check(sweep_run: str) -> Path:
     (config.CHECK_DIR / "msssim_alignment_basic.json").write_text(json.dumps({
         "self_comparison": self_score, "noise_levels": [1, 2, 5, 10],
         "noise_scores": [1.0] + noisy_scores,
-        "strictly_monotonic_decrease": all(a > b for a, b in zip([1.0] + noisy_scores, noisy_scores[1:] + [noisy_scores[-1] - 1e-12])),
+        "strictly_monotonic_decrease": strictly_monotonic,
         "alignment_samples": len(alignment_rows), "max_absolute_difference": max_difference,
         "torch_version": alignment_rows[0]["torch_version"],
         "pytorch_msssim_version": alignment_rows[0]["pytorch_msssim_version"]}, indent=2), encoding="utf-8")

@@ -158,8 +158,9 @@ def _comparison(rows: list[dict], run: Path) -> list[dict]:
             adaptive = by_key.get((vid, ratio, "A"), {})
             for baseline_group in ("B1", "B0"):
                 baseline = by_key.get((vid, ratio, baseline_group), {})
-                pa, pb = _float(adaptive, "psnr_y_db"), _float(baseline, "psnr_y_db")
-                ma, mb = _float(adaptive, "ms_ssim_db"), _float(baseline, "ms_ssim_db")
+                eligible = adaptive.get("status") == "ok" and baseline.get("status") == "ok"
+                pa, pb = (_float(adaptive, "psnr_y_db"), _float(baseline, "psnr_y_db")) if eligible else (None, None)
+                ma, mb = (_float(adaptive, "ms_ssim_db"), _float(baseline, "ms_ssim_db")) if eligible else (None, None)
                 delta_psnr = pa - pb if pa is not None and pb is not None else None
                 delta_ms = ma - mb if ma is not None and mb is not None else None
                 detail.append({"split": split, "video_id": vid, "ratio": ratio,
@@ -370,7 +371,7 @@ def _html(run: Path, rows: list[dict]) -> None:
         html_rows.append(f"<tr{color}>" + "".join(f"<td>{esc(row.get(k))}</td>" for k in visible) +
                          '<td><a href="attempts.jsonl#L1">attempts</a></td></tr>')
     links = [f'<li><a href="{name}">{name}</a></li>' for name in (
-        "comparisons.csv", "subjective_notes.csv", "attempts.jsonl", "run_config.json", "run_report.json")
+        "comparisons.csv", "subjective_notes.csv", "attempts.jsonl", "run_config.json", "phase_timing.json", "run_report.json")
         if (run / name).exists()]
     assets = []
     for folder in ("figs", "frames", "clips"):
