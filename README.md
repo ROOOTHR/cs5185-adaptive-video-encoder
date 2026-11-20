@@ -1,25 +1,23 @@
 # CS5185 内容自适应视频编码（v2）
 
-本仓库以 FFmpeg/libx264 完成固定体积预算的视频编码，使用逐帧特征与开发集扫描验证内容→参数规则。规则冻结后才运行独立 TEST。所有正式运行保存在各自的 results/runs/<run>/ 目录，含原始尝试、逐帧指标、视频产物和 index.html。
+以 FFmpeg/libx264 执行两档目标文件大小的视频编码，采用开发集扫描和预注册判据推导规则。v2 目前只从 DEV 支持一条 bpp→AQ-mode 规则；这代表预算率差异，不等于已经证明运动/纹理内容规则。每次实验保存在独立 `results/runs/<run>/`，含尝试记录、逐帧指标、视频产物和 HTML 索引。
 
 ## 当前状态
 
 | 项目 | v2 状态 |
 |---|---|
-| 数据源 | 外部只读数据集；CS5185_DATASET 可覆写路径 |
-| 数据划分 | DEV 01/02/03/04/07/08；VAL 11/12；TEST 05/06/09/10 |
-| 体积验收 | -3% ≤ size_error ≤ 0；不超过目标 |
-| 完整性 | 解码成功、帧数一致、时长误差不超过一帧、分辨率/帧率不变 |
-| MS-SSIM | FFmpeg 原始 Y 平面输入；接入评测并做 PyTorch 参考对齐 |
-| 规则/最终实验 | 以 docs/experiment_v2.md 和 frozen-v2 tag 为准；不得用 TEST 调参 |
+| 数据源/划分 | 外部只读数据集；DEV 01/02/03/04/07/08；VAL 11/12；TEST 05/06/09/10 |
+| 大小验收 | `-3% ≤ size_error ≤ 0`，任何超目标候选不接受 |
+| 完整性 | 解码成功、帧数相等、时长误差≤1帧，分辨率/帧率不变 |
+| MS-SSIM | FFmpeg Y 平面、接入评测、30 帧 PyTorch 参考对齐最大差 `1.8034227472485398e-6` |
+| DEV/VAL | 168 个候选中 164 个通过；VAL 8/8 通过。结果详见实验报告 |
+| TEST | 只能在规则冻结 tag `frozen-v2` 后运行一次；测试结果及索引将在最终实验后补录 |
 
-旧版汇总结果已从活动结果目录移除；不得把旧的“24/24 在 ±3% 内”表述当成 v2 上限验收。旧日志在 archive/v1_logs/ 保留，唯一修改过的日志行也原样保留。归档目录 legacy/ 与数据集不由本实验改动。
+旧版“24/24 在 ±3% 内”不等价于不超目标，不作为 v2 结果。旧日志保存在 `archive/v1_logs/`；外部 `legacy/` 和数据集均保持不变。
 
-## 环境
+## 环境和复现
 
-主程序已在 Python 3.14.7 验证；依赖见 requirements.txt。FFmpeg 由 imageio-ffmpeg 提供，必须包含 libx264。E1 对齐校验使用独立的 Python 3.12 环境：D:/gcg/Multimedia/project/_venv_msssim，其中安装 CPU PyTorch 与 pytorch-msssim；不加入主程序依赖。
-
-PowerShell 示例：
+主环境：Python 3.14.7、FFmpeg 7.1/libx264；项目依赖见 `requirements.txt`。E1 对齐用独立 CPU PyTorch 环境，非主程序依赖。报告、逐阶段命令、限制及预注册标准见 [`docs/experiment_v2.md`](docs/experiment_v2.md)。
 
 ```powershell
 $env:CS5185_DATASET = 'D:\gcg\Multimedia\project\CS5185_Project_Video_Dataset'
@@ -27,23 +25,27 @@ python run.py check-retry
 python run.py sweep --run sweep_v2
 python run.py align-check --run sweep_v2
 python run.py derive --run sweep_v2
+python -m pytest -q tests/test_decide.py
 python run.py validate --run val_v2
-# 代码/规则/文档提交后，确保 HEAD == frozen-v2 且 git status 干净
-# git tag -a frozen-v2 -m 'Freeze v2 rules after DEV and VAL'
+# 提交冻结代码/规则/预注册报告，确认工作区 clean 后创建 frozen-v2 tag
 python run.py final --run final_v2
 python run.py report --run final_v2
 ```
 
-完成后的实验命令、参数、阈值、扫描结果、留一法、VAL 和 TEST 指标详见 docs/experiment_v2.md；HTML 索引在 results/runs/final_v2/index.html。
+## 实验结果
 
-## 分阶段命令
+DEV 规则为 `bpp > 0.26137514467592593 → aq-mode=2`，否则 `aq-mode=1`。规则来自 AQ-mode=2 的两个显著 DEV 样本；运动和边缘特征没有形成合格分割，因此不得把这条规则称为已验证的纯内容规则。留一法参数一致 40/96，平均 MS-SSIM(dB) 损失 `0.04362710941110234`。VAL 全部落在阈值低侧，未触发 AQ-mode=2 分支；A−B1 平均 ΔMS-SSIM(dB) 为 `-0.0896528456999155`。完整结果及扫描图请看实验报告。
 
-- `features --run <name>`：提取全数据集特征（不把 TEST 特征用于拟合任何阈值）。
-- `sweep --run <name>`：只在 DEV 上对锚点逐个改变一个参数维度并跑反馈闭环。
-- `derive --run <sweep-name>`：只读 DEV 扫描表，生成至多 3 条规则及 LOOCV。
-- `validate --run <name>`：只跑 VAL，对比锚点，不再改规则。
-- `final --run <name>`：要求 frozen-v2 tag 指向当前 HEAD、工作区干净；串行跑 12×2×{B0,B1,A} 一次。
-- `report --run <name>`：生成表格、图、TEST 三联帧、并排短片、主观观察表和 HTML。
-- `align-check --run <sweep-name>` / `check-retry`：独立 E1/E3 小检查，保存在 results/checks/。
+冻结后的 TEST 对比表、主观图片与并排视频将保存在 `results/runs/final_v2/`，入口为 `index.html`；**最终实验尚未执行**。不要将 TEST 结果用于调整规则。
 
-E1 对齐校验、扫描和最终实验产物均不写回原始数据集。results/runs/ 与 results/checks/ 是本地交付产物，不纳入 Git，以避免提交大量视频；报告和摘要保存在工作区供查看。
+## 命令
+
+- `features --run <name>`：提取 12 个视频特征，仅用于报告；TEST 特征不得用于拟合。
+- `sweep --run <name>`：仅扫描 DEV。
+- `derive --run <sweep-name>`：仅从 DEV 表生成规则和 LOOCV。
+- `validate --run <name>`：冻结前只检查 VAL，不选参。
+- `final --run <name>`：要求 `frozen-v2` 指向 HEAD 且工作区干净；按串行顺序运行 12×2×{B0,B1,A}。
+- `report --run <name>`：生成对比 CSV、图、TEST 主观材料和 HTML。
+- `align-check --run <sweep-name>` / `check-retry`：E1/E3 独立检查，写入 `results/checks/`。
+
+所有编码与展示短片均由 FFmpeg 执行；结果不写回原始数据集。正式 run/check 产物为本地文件，按 `.gitignore` 不纳入 Git。

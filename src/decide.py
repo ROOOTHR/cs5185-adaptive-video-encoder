@@ -41,9 +41,11 @@ def decide(feat: dict, bud: dict, mode: str = "A", rules=None,
             matched = observed > threshold if rule["operator"] == "gt" else observed <= threshold
             parameter = rule["parameter"]
             params[parameter] = rule["value"] if matched else rule["fallback"]
+            observed_relation = ">" if observed > threshold else "<="
+            branch = "命中" if matched else "未命中"
             reasons.append(
-                f"{name}={observed:.6g} {'>' if rule['operator'] == 'gt' else '<='} "
-                f"{threshold:.6g} -> {parameter}={params[parameter]} "
+                f"检测到 {name}={observed:.6g} {observed_relation} {threshold:.6g}，{branch}规则 -> "
+                f"{parameter}={params[parameter]} "
                 f"({rule.get('source', 'validated rule')})")
     return {"mode": mode, "params": params, "reasons": reasons,
             "motion": "low" if feat["stats"]["mafd"]["mean"] < 5 else "high",
