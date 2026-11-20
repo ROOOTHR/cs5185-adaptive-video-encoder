@@ -1,24 +1,29 @@
-# 虚拟环境与缓存
+# Virtual environments and caches
 .venv/
 .pip-cache/
 __pycache__/
 *.pyc
 
-# 数据集与编码产物（体积大，不入库）
+# Large datasets and encoding outputs
 data/raw/
 data/out/
 data/out_baseline/
 data/out_v1_uncalibrated/
 
-# x264 两遍编码的中间日志
+# x264 pass logs
 *.log
 *.log.mbtree
 x264_2pass.log*
 
-# 诊断脚本的临时产物
+# Diagnostic temporary outputs
 _diag/*.mp4
 _diag/*.txt
 
-# 编辑器
+# Editors
 .idea/
 .vscode/
+
+# Reproducible run artifacts stay local; documentation and code are committed
+results/runs/
+results/checks/
+/docs/tasks/codex_v2_task.md

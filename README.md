@@ -1,182 +1,49 @@
-# CS5185 内容自适应视频编码系统
+# CS5185 内容自适应视频编码（v2）
 
-给定文件体积上限，先判断画面是「静」还是「动」、细节是「多」还是「少」，
-再决定把有限码率花在哪里；压完量一下，不达标就调，每轮都留记录。
-
----
+本仓库以 FFmpeg/libx264 完成固定体积预算的视频编码，使用逐帧特征与开发集扫描验证内容→参数规则。规则冻结后才运行独立 TEST。所有正式运行保存在各自的 results/runs/<run>/ 目录，含原始尝试、逐帧指标、视频产物和 index.html。
 
 ## 当前状态
 
-| 模块 | 状态 | 说明 |
-|---|---|---|
-| 数据准备 | ✅ 已跑通 | 12 个 mp4 + metadata 已解压到 `data/raw/` |
-| 内容特征提取 | ✅ 已跑通 | 12 个视频共 1800 帧，30 秒跑完 |
-| 参数决策 | ✅ 已跑通 | 24 组（12 视频 × 2 档）已导出 CSV |
-| 报告图 | ✅ 已生成 | 特征时间线、分类散点 |
-| FFmpeg 编码 | ✅ 已跑通 | 经 `imageio-ffmpeg` 提供，48 次两遍编码全部成功 |
-| 结果评测 | ✅ 已跑通 | 体积误差 24/24 在 ±3% 内，解码校验全通过 |
+| 项目 | v2 状态 |
+|---|---|
+| 数据源 | 外部只读数据集；CS5185_DATASET 可覆写路径 |
+| 数据划分 | DEV 01/02/03/04/07/08；VAL 11/12；TEST 05/06/09/10 |
+| 体积验收 | -3% ≤ size_error ≤ 0；不超过目标 |
+| 完整性 | 解码成功、帧数一致、时长误差不超过一帧、分辨率/帧率不变 |
+| MS-SSIM | FFmpeg 原始 Y 平面输入；接入评测并做 PyTorch 参考对齐 |
+| 规则/最终实验 | 以 docs/experiment_v2.md 和 frozen-v2 tag 为准；不得用 TEST 调参 |
 
-> `python run.py check-env` 会列出 ffmpeg 的实际路径、来源、libx264 是否可用。
-
----
-
-## 实验结果
-
-自适应（`--mode adaptive`）与统一基线（`--mode fixed`）在同一 12 个视频、同一 5% / 2% 预算下各跑 24 组。
-
-| 指标 | 自适应 | 统一基线 |
-|---|---|---|
-| 平均体积误差 | −1.75% | −1.68% |
-| 误差范围 | −2.98% ~ +0.96% | −3.78% ~ +0.83% |
-| 落在自设 ±3% 带内 | **24 / 24** | 23 / 24 |
-| 平均 PSNR-Y | **38.26 dB** | 38.09 dB |
-| 平均单任务耗时 | 10.9 s | 11.5 s |
-| 解码校验 | 24 / 24 通过 | 24 / 24 通过 |
-
-**逐组胜负：胜 20 / 负 1 / 平 3，平均 +0.17 dB。** 详见 `results/compare.csv` 与
-`docs/design.md` 第 6 节。增益不大，但方向稳定，且自适应是在体积误差更偏负
-（花更少字节）的前提下取得的。
-
-产物：
-
-```
-results/compare.csv                  逐视频逐档对比
-results/figs/compare_psnr_0.02.png   绝对画质 + 增益双面板
-results/figs/compare_psnr_0.05.png
-results/figs/compare_gain_vs_detail.png   增益 vs 细节密度（r = +0.60）
-```
-
----
-
-## 目录结构
-
-```
-mediaproject/
-├── run.py                 命令行入口
-├── requirements.txt
-├── data/
-│   ├── raw/               原始数据集（12 mp4 + metadata + licenses）
-│   └── out/               编码输出，按 video_id/ 分层，每轮候选都保留
-├── logs/                  每次尝试一行 JSONL（附录 E2 的字段）
-├── results/
-│   ├── features/          12 个视频的逐帧特征
-│   ├── figs/              报告用图
-│   ├── decision_table.csv 24 组参数决策
-│   └── summary.csv        编码汇总（跑完 encode 后生成）
-├── src/
-│   ├── config.py          路径与常量
-│   ├── metadata.py        元数据 + 预算公式（附录 B2）
-│   ├── features.py        内容特征（第 1 步）
-│   ├── decide.py          参数决策（第 2 步）
-│   ├── encode.py          FFmpeg 两遍编码（第 3 步）
-│   ├── evaluate.py        结果检查（第 4 步）
-│   ├── pipeline.py        五步闭环编排
-│   └── report.py          画图
-└── docs/design.md         设计决策与依据（写报告时直接用）
-```
-
----
+旧版汇总结果已从活动结果目录移除；不得把旧的“24/24 在 ±3% 内”表述当成 v2 上限验收。旧日志在 archive/v1_logs/ 保留，唯一修改过的日志行也原样保留。归档目录 legacy/ 与数据集不由本实验改动。
 
 ## 环境
 
-| 组件 | 是否必需 | 本机状态 |
-|---|---|---|
-| Python 3.9+ | 必需 | ✅ `.venv`（3.11.3，位于项目内，不占 C 盘） |
-| numpy / opencv-python / matplotlib | 必需 | ✅ 已装 |
-| **FFmpeg + libx264** | **必需** | ✅ 经 `imageio-ffmpeg` 提供（gyan.dev essentials 9.0.2） |
-| ffprobe | 可选 | ➖ 没有；`evaluate.py` 已改为正则解析 `ffmpeg -i` 输出 |
-| torch / pytorch-msssim | 可选 | ➖ 没有；`src/ms_ssim.py` 为纯 numpy 实现 |
+主程序已在 Python 3.14.7 验证；依赖见 requirements.txt。FFmpeg 由 imageio-ffmpeg 提供，必须包含 libx264。E1 对齐校验使用独立的 Python 3.12 环境：D:/gcg/Multimedia/project/_venv_msssim，其中安装 CPU PyTorch 与 pytorch-msssim；不加入主程序依赖。
 
-**为什么不用系统 FFmpeg？** C 盘只剩 6GB，装便携包要往 C 盘塞。`imageio-ffmpeg`
-通过 pip 装进项目内的 venv，几十 MB，自带 libx264，且能把路径写死、不依赖 PATH。
-它就一条 `pip install imageio-ffmpeg`，换机器复现也简单。
+PowerShell 示例：
 
-装依赖（已做过，重装才需要）：
-
-```bash
-.venv/Scripts/python.exe -m pip install -r requirements.txt
+```powershell
+$env:CS5185_DATASET = 'D:\gcg\Multimedia\project\CS5185_Project_Video_Dataset'
+python run.py check-retry
+python run.py sweep --run sweep_v2
+python run.py align-check --run sweep_v2
+python run.py derive --run sweep_v2
+python run.py validate --run val_v2
+# 代码/规则/文档提交后，确保 HEAD == frozen-v2 且 git status 干净
+# git tag -a frozen-v2 -m 'Freeze v2 rules after DEV and VAL'
+python run.py final --run final_v2
+python run.py report --run final_v2
 ```
 
-想换成系统 FFmpeg 也可以：把 `ffmpeg.exe` 放进 PATH 即可，`src/encode.py` 的
-`_exe()` 会优先用 PATH 里的版本。换完务必验证 libx264 存在：
+完成后的实验命令、参数、阈值、扫描结果、留一法、VAL 和 TEST 指标详见 docs/experiment_v2.md；HTML 索引在 results/runs/final_v2/index.html。
 
-```bash
-ffmpeg -hide_banner -h encoder=libx264
-```
+## 分阶段命令
 
-看到参数列表 = 可用；报 `Unknown encoder` = 下错了构建，换 gyan.dev 的 essentials/full
-或 BtbN 的 win64-gpl。
+- `features --run <name>`：提取全数据集特征（不把 TEST 特征用于拟合任何阈值）。
+- `sweep --run <name>`：只在 DEV 上对锚点逐个改变一个参数维度并跑反馈闭环。
+- `derive --run <sweep-name>`：只读 DEV 扫描表，生成至多 3 条规则及 LOOCV。
+- `validate --run <name>`：只跑 VAL，对比锚点，不再改规则。
+- `final --run <name>`：要求 frozen-v2 tag 指向当前 HEAD、工作区干净；串行跑 12×2×{B0,B1,A} 一次。
+- `report --run <name>`：生成表格、图、TEST 三联帧、并排短片、主观观察表和 HTML。
+- `align-check --run <sweep-name>` / `check-retry`：独立 E1/E3 小检查，保存在 results/checks/。
 
----
-
-## 使用
-
-```bash
-# 0. 检查环境
-.venv/Scripts/python.exe run.py check-env
-
-# 1. 提取内容特征（约 30 秒）
-.venv/Scripts/python.exe run.py features
-
-# 2. 生成参数决策表 -> results/decision_table.csv
-.venv/Scripts/python.exe run.py plan
-
-# 3. 画报告图 -> results/figs/
-.venv/Scripts/python.exe run.py report
-
-# 4. 跑完整闭环
-.venv/Scripts/python.exe run.py encode --ids 01_FourPeople --ratios 0.05
-.venv/Scripts/python.exe run.py encode            # 全部 12 个 × 2 档（自适应）
-.venv/Scripts/python.exe run.py encode --mode fixed   # 基线对照组
-
-# 5. 生成自适应 vs 基线的对比表与图 -> results/compare.csv、figs/compare_*.png
-.venv/Scripts/python.exe -c "from src import compare; compare.report(compare.compare())"
-```
-
-> `encode` 的汇总表是**按 (视频, 档位) 合并更新**的，用 `--ids` 只重跑一个视频
-> 不会抹掉其余行。
-
----
-
-## 三条不能违反的约束
-
-1. **只能用 FFmpeg 的 libx264**，不许改 x264 源码，不许换成别的编码器。
-2. **输出必须完整时长、可解码**，不许靠删帧、剪短、改分辨率凑体积。
-3. **单位是十进制**：1 MB = 1,000,000 字节。项目 PDF 的 "63.90 MB" 就是 63,899,977 字节。
-
----
-
-## 踩过的坑（写报告时可以直接用）
-
-### 1. PDF 表格里的 bitrate 列不能直接用
-
-它是按「整数 MB」倒算的，且没扣容器开销。以 09_Parkrun 为例：表里写 8.0 Mbps，
-按精确公式应是 9.09 Mbps —— 相差 13%，照表里的数编码会白白浪费八分之一预算。
-
-### 2. 12_ControlledBurn 的 2% 目标「18 Mbps」是笔误
-
-按公式 1.1 MB × 8 ÷ 5s ≈ 1.76 Mbps，应为 1.8 Mbps。本项目一律按 `metadata.json`
-里的准确字节数重算，不受影响。
-
-### 3. 纯 ABR 两遍编码在 5 秒短片上会过冲 40%
-
-02_Beauty 的 5% 任务编出来比目标大 40%。逐项排查 preset / GOP / bf / refs / AQ，
-甚至只留 `-b:v` 也照样超 —— 说明不是参数问题，是两遍 ABR 本身没有码率上限约束，
-短片段里 x264 会先花后补，尾巴补不回来。
-
-解法是加 VBV：`-maxrate <kbps> -bufsize <kbps>`（1 秒缓冲）。加完立刻降到 −6.5%，
-反馈循环也从「+40% → −10.6% → +8.0%」的震荡变成两轮收敛。
-
-### 4. 「按内容分类调参」的 3×3 规则表输给了固定参数
-
-第一版按运动量（mafd）和细节量（edge_ratio）分成九宫格，每格给不同 preset / GOP / bf。
-结果平均 PSNR **−0.23 dB**（胜 9 / 负 13 / 平 2，共 24 组）。
-
-做了控制变量扫描才明白：**12 个视频里只有 GOP 显著**，g=30→150 能带来
-+0.51 dB（高运动）、+1.33 dB（12_ControlledBurn）、+0.1~0.36 dB（低运动）；
-preset / bf / refs / AQ 的差异全在 ±0.2 dB 以内，属于噪声。
-
-所以最终版本干脆不用九宫格，全部走同一套校准配置。改回 `g=150` 之后，
-同一批 24 组的平均增益从 **−0.23 dB 翻到 +0.17 dB**（胜 20 / 负 1 / 平 3）。
-这个过程本身比「调出一个好参数」更值得写进报告 —— 见 `docs/design.md` 第 4 节和第 6 节。
-
+E1 对齐校验、扫描和最终实验产物均不写回原始数据集。results/runs/ 与 results/checks/ 是本地交付产物，不纳入 Git，以避免提交大量视频；报告和摘要保存在工作区供查看。
