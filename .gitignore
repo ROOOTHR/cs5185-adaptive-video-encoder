@@ -49,3 +49,5 @@ _diag/sw_*
 
 # ---- 不入库的过程文档（含本机绝对路径）----
 /docs/tasks/codex_v2_task.md
+
+results/runs/*/*/videos/

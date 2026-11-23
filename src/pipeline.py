@@ -9,6 +9,31 @@ from . import config, encode, evaluate
 from .metadata import budget
 
 
+POLICIES = ("proportional", "center", "secant")
+AIM_FRACTION = 0.985          # middle of the -3%..0 acceptance window
+SLOPE_BOUNDS = (0.5, 2.0)     # secant slope must be within these multiples of actual/requested
+
+
+def next_rate(policy: str, history: list[tuple[int, int]], target_bytes: int) -> float:
+    """Next requested kbps from [(requested_kbps, actual_bytes), ...], oldest first (before clamping)."""
+    if policy not in POLICIES:
+        raise ValueError(f"unknown feedback policy: {policy}")
+    kbps, actual = history[-1]
+    actual = max(actual, 1)
+    if policy == "proportional":
+        margin = config.OVERHEAD if actual > target_bytes else 1.0
+        return kbps * target_bytes / actual * margin
+    aim = target_bytes * AIM_FRACTION
+    rate = kbps * aim / actual
+    if policy == "secant" and len(history) >= 2:
+        (k0, b0), (k1, b1) = history[-2], history[-1]
+        if k1 != k0:
+            slope, proportional_slope = (b1 - b0) / (k1 - k0), b1 / k1
+            if SLOPE_BOUNDS[0] * proportional_slope <= slope <= SLOPE_BOUNDS[1] * proportional_slope:
+                rate = k1 + (aim - b1) / slope
+    return rate
+
+
 def pick_best(attempts: list[dict]) -> dict | None:
     eligible = [row for row in attempts if row.get("status") == "ok"]
     return max(eligible, key=lambda row: row["measurements"]["actual_bytes"], default=None)
@@ -16,14 +41,14 @@ def pick_best(attempts: list[dict]) -> dict | None:
 
 def run_candidate(video_id: str, ratio: float, group: str, params: dict,
                   feature: dict, meta: dict, run_dir: Path,
-                  initial_kbps: int | None = None, reasons=()) -> dict:
+                  initial_kbps: int | None = None, reasons=(), policy: str = "proportional") -> dict:
     started = time.perf_counter()
     bud0 = budget(meta, ratio)
     kbps = int(initial_kbps or bud0["video_kbps"])
     video_dir = run_dir / "videos" / video_id
     video_dir.mkdir(parents=True, exist_ok=True)
     attempts_path = run_dir / "attempts.jsonl"
-    attempts, measurements = [], {}
+    attempts, measurements, history = [], {}, []
     for number in range(1, config.MAX_ATTEMPTS + 1):
         name = f"{group}_{int(ratio * 100):02d}pct_a{number}"
         out = video_dir / f"{name}.mp4"
@@ -39,7 +64,7 @@ def run_candidate(video_id: str, ratio: float, group: str, params: dict,
                   "planned_kbps": kbps, "features": feature["stats"],
                   "parameters": dict(params), "reasons": list(reasons),
                   "ffmpeg_commands": [item["cmd"] for item in encoded["passes"]],
-                  "returncodes": codes, "encode_time_s": encode_time}
+                  "returncodes": codes, "encode_time_s": encode_time, "feedback_policy": policy}
         if len(codes) != 2 or any(code != 0 for code in codes) or not out.is_file():
             tail = encoded["passes"][-1]["stderr_tail"] if encoded["passes"] else "no FFmpeg pass completed"
             record.update(status="failed", failure_reason=f"encode failed: {tail}", next_action="stop")
@@ -64,8 +89,8 @@ def run_candidate(video_id: str, ratio: float, group: str, params: dict,
             elif number == config.MAX_ATTEMPTS:
                 record["next_action"] = "exhausted"
             else:
-                margin = config.OVERHEAD if measured["actual_bytes"] > bud0["target_bytes"] else 1.0
-                raw_rate = kbps * bud0["target_bytes"] / max(measured["actual_bytes"], 1) * margin
+                history.append((kbps, measured["actual_bytes"]))
+                raw_rate = next_rate(policy, history, bud0["target_bytes"])
                 low, high = kbps * (1 - config.MAX_ADJUST), kbps * (1 + config.MAX_ADJUST)
                 record.update(next_action="retry",
                               next_kbps=max(50, int(round(min(max(raw_rate, low), high)))),
