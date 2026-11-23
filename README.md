@@ -6,7 +6,7 @@
 
 | 项目 | v2 结果 |
 |---|---|
-| 分支 / 冻结 | `exp-v2`；`frozen-v2` → `55516859a134dfbdf64a5811a33ed9a344fb9820`（未 push） |
+| 分支 / 冻结 | `v2`（远程 `origin/v2`）；冻结 tag `frozen-v2` → `55516859a134dfbdf64a5811a33ed9a344fb9820`（tag 仅在本机，远程没有，复现时按下文用该 commit 重建） |
 | 划分 | DEV 01/02/03/04/07/08；VAL 11/12；TEST 05/06/09/10 |
 | 体积验收 | 72 组无超目标；B0 24/24、B1 24/24、A 23/24 完全通过 `-3%..0`，A 有 1 组低于下限 |
 | MS-SSIM | FFmpeg 灰度/Y 平面；30 帧 PyTorch 对齐最大差 `1.8034227472485398e-6` |
@@ -16,13 +16,16 @@
 
 正式实验在 `frozen-v2` 后只执行一次。`10_Stockholm` 5% 的 A 在 4 次尝试后 size_error 为 `-0.032729066206098764`，未达到最小目标体积，判失败并排除出配对均值；没有 TEST 超目标输出。详细逐视频值、偏离、限制和相对路径图片见 [`docs/experiment_v2.md`](docs/experiment_v2.md)。
 
-旧版“24/24 在 ±3% 内”不等于不超目标，不作为 v2 验收。旧日志保存在仓库 `archive/v1_logs/`；外部 `legacy/` 和数据集目录不由本次改动。
+旧版“24/24 在 ±3% 内”不等于不超目标，不作为 v2 验收。旧版（v1）的设计与结果归档在 [`results/legacy_v1/`](results/legacy_v1/)，旧日志在 `archive/v1_logs/`；它们受测试集调参影响，只作探索阶段记录。
 
 ## 环境和复现
 
 主环境 Python 3.14.7、FFmpeg 7.1/libx264；实际依赖版本以 `results/runs/final_v2/run_config.json` 为准（旧 `requirements.txt` 与实测版本不同）。独立 E1 环境含 CPU PyTorch 与 pytorch-msssim，不属于主程序依赖。
 
 ```powershell
+git clone https://github.com/ROOOTHR/cs5185-adaptive-video-encoder
+cd cs5185-adaptive-video-encoder
+git checkout v2
 $env:CS5185_DATASET = 'D:\gcg\Multimedia\project\CS5185_Project_Video_Dataset'
 python run.py check-retry
 python run.py features --run features_v2
@@ -31,11 +34,17 @@ python run.py align-check --run sweep_v2
 python run.py derive --run sweep_v2
 python -m pytest -q tests/test_decide.py
 python run.py validate --run val_v2
-# 历史正式运行在干净的 frozen-v2 提交；独立复现应在该 tag 执行 final，不要移动 tag
+# final 必须在冻结提交上执行（要求 frozen-v2 tag 指向 HEAD 且工作区干净）。
+# 远程没有该 tag，先在 v2 的历史里按 commit 重建，不要指向别处：
+git tag frozen-v2 55516859a134dfbdf64a5811a33ed9a344fb9820
+git checkout frozen-v2
 python run.py final --run final_v2
-# 生成展示材料时使用 exp-v2 的报告器
+# 展示材料用 v2 分支的报告器生成
+git checkout v2
 python run.py report --run final_v2
 ```
+
+> 上面的流程没有在全新克隆上完整重放验证过。切换到冻结提交前请先确认工作区干净（`final` 会拒绝有未提交或未跟踪文件的工作区）；重现时请为 run 换新名字，程序不会覆盖已有目录。
 
 ## 实验结果与交付
 
@@ -57,4 +66,4 @@ python run.py report --run final_v2
 - `report --run <name>`：图、TEST 主观材料、CSV 和 HTML。
 - `align-check --run <sweep-name>` / `check-retry`：独立 E1/E3 检查。
 
-所有编码与展示片均由 FFmpeg 执行；输出不写回数据集。`results/runs/`、`results/checks/` 是本地交付产物，不纳入 Git。
+所有编码与展示片均由 FFmpeg 执行；输出不写回数据集。`results/` 下入库的是结论与可追溯证据（汇总表、逐轮记录、逐帧指标、图、三联帧、观察表），程序可重新生成的体积项（`videos/`、x264 日志、`.npz`、并排短片）不入库，详见 [`results/README.md`](results/README.md)。

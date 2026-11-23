@@ -27,8 +27,10 @@ python run.py derive --run sweep_v2
 python -m pytest -q tests/test_decide.py
 python run.py validate --run val_v2
 # 历史正式运行在干净的 frozen-v2 提交；独立复现应在该 tag 执行 final，不要移动 tag
+# （远程没有该 tag：git tag frozen-v2 55516859a134dfbdf64a5811a33ed9a344fb9820 && git checkout frozen-v2）
 python run.py final --run final_v2
-# 生成展示材料时使用 exp-v2 的报告器
+# 生成展示材料时回到 v2 分支，使用其报告器
+git checkout v2
 python run.py report --run final_v2
 ```
 
@@ -48,7 +50,7 @@ TEST 只在冻结 tag 后运行一次。重现时请为已存在的 run 目录�
 - VAL：11、12，仅用于冻结前检查，不选参。
 - TEST：05、06、09、10，v2 final 前没有用于规则拟合；冻结后执行唯一一次 `final_v2`。
 - `sweep/derive` 只允许 DEV IDs；`final` 要求 `frozen-v2` 指向当前 HEAD 且开始时工作区干净。
-- 冻结 tag `frozen-v2` 指向 commit `55516859a134dfbdf64a5811a33ed9a344fb9820`（短 hash `5551685`）。Final 的 `run_config.json` 记录相同 commit、`git_dirty=false`、数据集哈希通过。分支为 `exp-v2`，未 push。
+- 冻结 tag `frozen-v2` 指向 commit `55516859a134dfbdf64a5811a33ed9a344fb9820`（短 hash `5551685`）。Final 的 `run_config.json` 记录相同 commit、`git_dirty=false`、数据集哈希通过。代码分支为 `v2`，已推送到 `origin/v2`；`frozen-v2` tag 仅在本机，远程没有。
 
 冻结后仅对 `src/report.py` 作报告修正：让未通过验收的 A 候选也生成标有诊断用途的三联帧/短片，并在 HTML 标红失败行、标注诊断短片。同时保留已有人工观察表，避免重建报告时覆盖。没有改编码器决策、参数、输入或重跑 final；因此 tag 保持在实际编码使用的冻结提交，分支最新报告提交在 tag 之后。
 
@@ -242,4 +244,4 @@ final 串行执行 12 视频 × 2 档 × B0/B1/A，共 72 组；正式总耗时 
 - 扫描 run_config 的 OpenCV 包版本字段为 null，是发生在环境版本收集修正之前的记录；原始 run_config 保留，VAL 和 final 记录正确版本。
 - 全 12 视频的纯特征提取是在 DEV 扫描启动后补跑；规则拟合仍只读取 DEV，VAL 独立检查，TEST 在冻结前未用于调参。
 - 报告器的失败候选展示修正在冻结后完成；没有触碰冻结规则或 final 编码数据。HTML 已核验首页渲染，未逐一交互播放所有嵌入短片。
-- 本次未 push。最终结果文件大（视频/图片），按 `.gitignore` 保持本地；报告和代码在 Git 中提交。
+- 代码、报告和可追溯的结果证据已提交到 `origin/v2`；全部候选视频、x264 日志和并排短片因体积大不入库，只保留在本机（见 `results/README.md`）。
