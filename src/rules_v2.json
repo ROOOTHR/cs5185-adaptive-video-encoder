@@ -1,0 +1,29 @@
+{
+  "pre_registered": {
+    "metric": "delta_ms_ssim_db",
+    "significance_ms_ssim_db": 0.1,
+    "minimum_delta_psnr_y_db": -0.3,
+    "features": [
+      "edge_ratio",
+      "mafd",
+      "luma_std",
+      "bpp"
+    ],
+    "max_rules": 3
+  },
+  "rules": [
+    {
+      "dimension": "aq-mode",
+      "feature": "bpp",
+      "operator": "gt",
+      "threshold": 0.26137514467592593,
+      "parameter": "aq",
+      "value": 2,
+      "fallback": 1,
+      "source": "sweep_summary.csv",
+      "significant_samples": 2,
+      "mean_positive_delta_ms_ssim_db": 0.11939550014968603,
+      "candidate": "aq_mode_2"
+    }
+  ]
+}

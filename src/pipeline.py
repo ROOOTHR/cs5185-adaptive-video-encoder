@@ -1,166 +1,143 @@
-"""五步闭环（项目第 1-5 步的编排）。
-
-对应附录 A 的控制流：分析 -> 决策 -> 编码 -> 检查 -> 调整。
-每次尝试的候选都保留，最后按"不超目标且最接近"挑一个，不会因为后续失败丢掉前一轮的可用结果。
-"""
-
+"""Per-candidate feedback loop; keeps every attempted output in the run."""
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
-
-from . import config, decide, encode, evaluate, features
-from . import metadata as meta_mod
-
-TOL = 0.03          # 体积误差容忍 3%
-MAX_ADJUST = 0.30   # 单轮码率调整不超过 ±30%，防止震荡
+from . import config, encode, evaluate
+from .metadata import budget
 
 
-def _fmt_ratio(r: float) -> str:
-    return f"{int(round(r * 100)):02d}pct"
+POLICIES = ("proportional", "center", "secant")
+AIM_FRACTION = 0.985          # middle of the -3%..0 acceptance window
+SLOPE_BOUNDS = (0.5, 2.0)     # secant slope must be within these multiples of actual/requested
+
+
+def next_rate(policy: str, history: list[tuple[int, int]], target_bytes: int) -> float:
+    """Next requested kbps from [(requested_kbps, actual_bytes), ...], oldest first (before clamping)."""
+    if policy not in POLICIES:
+        raise ValueError(f"unknown feedback policy: {policy}")
+    kbps, actual = history[-1]
+    actual = max(actual, 1)
+    if policy == "proportional":
+        margin = config.OVERHEAD if actual > target_bytes else 1.0
+        return kbps * target_bytes / actual * margin
+    aim = target_bytes * AIM_FRACTION
+    rate = kbps * aim / actual
+    if policy == "secant" and len(history) >= 2:
+        (k0, b0), (k1, b1) = history[-2], history[-1]
+        if k1 != k0:
+            slope, proportional_slope = (b1 - b0) / (k1 - k0), b1 / k1
+            if SLOPE_BOUNDS[0] * proportional_slope <= slope <= SLOPE_BOUNDS[1] * proportional_slope:
+                rate = k1 + (aim - b1) / slope
+    return rate
 
 
 def pick_best(attempts: list[dict]) -> dict | None:
-    """优先选不超目标且最接近的；全都超则选最小的。"""
-    done = [a for a in attempts if a.get("status") == "ok"]
-    if not done:
-        return None
-    under = [a for a in done if a["actual_bytes"] <= a["target_bytes"]]
-    pool = under or done
-    return min(pool, key=lambda a: abs(a["actual_bytes"] - a["target_bytes"]))
+    eligible = [row for row in attempts if row.get("status") == "ok"]
+    return max(eligible, key=lambda row: row["measurements"]["actual_bytes"], default=None)
 
 
-def run_task(video_id: str, ratio: float, verbose: bool = True,
-             mode: str = "adaptive") -> dict:
-    """mode='adaptive' 走规则表；mode='fixed' 是统一基线对照组。"""
-    t0 = time.perf_counter()
-    config.ensure_dirs()
-
-    src = config.RAW_DIR / f"{video_id}.mp4"
-    meta = meta_mod.load_meta(video_id)
-    feat = features.load(video_id)
-    bud0 = meta_mod.budget(meta, ratio)
-    plan = decide.decide(feat, bud0, mode=mode)
-
-    out_root = config.OUT_DIR if mode == "adaptive" else config.BASELINE_DIR
-    tag = f"{video_id}_{_fmt_ratio(ratio)}" + ("" if mode == "adaptive" else "_base")
-    log_path = config.LOG_DIR / f"{tag}.jsonl"
-    attempts: list[dict] = []
-    kbps = bud0["video_kbps"]
-    prev_bytes: int | None = None
-
-    for n in range(1, config.MAX_ATTEMPTS + 1):
-        out = out_root / video_id / f"{_fmt_ratio(ratio)}_a{n}.mp4"
-        job = f"{tag}_a{n}"
-        bud = dict(bud0, video_kbps=kbps, video_bps=kbps * 1000)
-
-        te = time.perf_counter()
-        enc = encode.two_pass(src, out, plan, bud, job)
-        enc_time = round(time.perf_counter() - te, 2)
-
-        rec = {
-            "job_id": job,
-            "attempt_id": n,
-            "video_id": video_id,
-            "target_ratio": ratio,
-            "target_bytes": bud0["target_bytes"],
-            "planned_kbps": kbps,
-            "motion": plan["motion"],
-            "detail": plan["detail"],
-            "features": {
-                "mafd": feat["stats"]["mafd"]["mean"],
-                "edge_ratio": feat["stats"]["edge_ratio"]["mean"],
-                "scene_cuts": len(feat.get("scene_cuts", [])),
-            },
-            "parameters": plan["params"],
-            "encode_time_s": enc_time,
-            "ffmpeg_cmd": enc["passes"][-1]["cmd"] if enc["passes"] else [],
-            "returncode": enc["passes"][-1]["returncode"] if enc["passes"] else -1,
-        }
-
-        failed = rec["returncode"] != 0 or not out.exists()
-        if failed:
-            rec.update(status="encode_failed",
-                       failure_reason=(enc["passes"][-1]["stderr_tail"] if enc["passes"] else "no run"))
-            attempts.append(rec)
+def run_candidate(video_id: str, ratio: float, group: str, params: dict,
+                  feature: dict, meta: dict, run_dir: Path,
+                  initial_kbps: int | None = None, reasons=(), policy: str | None = None) -> dict:
+    policy = policy or config.FEEDBACK_POLICY
+    started = time.perf_counter()
+    bud0 = budget(meta, ratio)
+    kbps = int(initial_kbps or bud0["video_kbps"])
+    video_dir = run_dir / "videos" / video_id
+    video_dir.mkdir(parents=True, exist_ok=True)
+    attempts_path = run_dir / "attempts.jsonl"
+    attempts, measurements, history = [], {}, []
+    for number in range(1, config.MAX_ATTEMPTS + 1):
+        name = f"{group}_{int(ratio * 100):02d}pct_a{number}"
+        out = video_dir / f"{name}.mp4"
+        job = str(video_dir / name)
+        plan = {"params": dict(params), "motion": "n/a", "detail": "n/a"}
+        encode_started = time.perf_counter()
+        encoded = encode.two_pass(config.RAW_DIR / meta["file"], out, plan,
+                                  dict(bud0, video_kbps=kbps), job)
+        encode_time = time.perf_counter() - encode_started
+        codes = [item["returncode"] for item in encoded["passes"]]
+        record = {"job_id": name, "attempt_id": number, "video_id": video_id,
+                  "group": group, "target_ratio": ratio, "target_bytes": bud0["target_bytes"],
+                  "planned_kbps": kbps, "features": feature["stats"],
+                  "parameters": dict(params), "reasons": list(reasons),
+                  "ffmpeg_commands": [item["cmd"] for item in encoded["passes"]],
+                  "returncodes": codes, "encode_time_s": encode_time, "feedback_policy": policy}
+        if len(codes) != 2 or any(code != 0 for code in codes) or not out.is_file():
+            tail = encoded["passes"][-1]["stderr_tail"] if encoded["passes"] else "no FFmpeg pass completed"
+            record.update(status="failed", failure_reason=f"encode failed: {tail}", next_action="stop")
         else:
-            ev = evaluate.evaluate(out, src, meta["bytes"], bud0["target_bytes"])
-            rec.update(status="ok", **ev)
-            err = ev["size_error"] or 0
-
-            # 撞到内容上限：已经低于目标，但码率再加也不再涨（06_ShakeNDry 就是这样，
-            # 内容太容易编码，x264 到最低 QP 后无法再花掉比特）。继续调只是白跑。
-            capped = (prev_bytes is not None
-                      and ev["actual_bytes"] < bud0["target_bytes"] * 0.95
-                      and ev["actual_bytes"] <= prev_bytes * 1.03)
-            prev_bytes = ev["actual_bytes"]
-
-            if capped:
-                rec["next_action"] = "capped"
-                rec["reason"] = "码率提高后体积几乎不变，判定已达内容上限"
-            elif abs(err) <= TOL:
-                rec["next_action"] = "accept"
-            elif n < config.MAX_ATTEMPTS:
-                rec["next_action"] = "adjust"
-                raw = kbps * bud0["target_bytes"] / ev["actual_bytes"] * config.OVERHEAD
-                lo, hi = kbps * (1 - MAX_ADJUST), kbps * (1 + MAX_ADJUST)
-                nxt = max(50, int(round(min(max(raw, lo), hi))))
-                rec["next_kbps"] = nxt
-                rec["reason"] = (f"实际 {ev['actual_MB']}MB / 目标 {ev['target_MB']}MB，"
-                                 f"误差 {err:+.1%}，码率 {kbps} -> {nxt} kbps")
+            eval_started = time.perf_counter()
+            measured = evaluate.evaluate(out, config.RAW_DIR / meta["file"], meta, bud0["target_bytes"])
+            eval_time = time.perf_counter() - eval_started
+            record["eval_time_s"] = eval_time
+            measurements[number] = measured
+            record["measurements"] = {key: measured.get(key) for key in (
+                "actual_bytes", "size_error", "duration_s", "frame_count", "decode_ok", "file_kbps",
+                "psnr_y_db", "ms_ssim", "ms_ssim_db", "ms_ssim_min", "actual_video_kbps")}
+            record.update(status="ok" if measured["valid"] else "rejected",
+                           failure_reason=measured["failure_reason"] or None,
+                           output_path=str(out))
+            if measured["valid"]:
+                record["next_action"] = "accept"
+            elif any(not (e.startswith("actual_bytes exceeds") or
+                          e.startswith("actual_bytes is more than 3% below"))
+                     for e in measured["integrity_errors"]):
+                record["next_action"] = "stop_integrity_failure"
+            elif number == config.MAX_ATTEMPTS:
+                record["next_action"] = "exhausted"
             else:
-                rec["next_action"] = "exhausted"
-            attempts.append(rec)
-
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-        if verbose:
-            st = rec["status"]
-            if st == "ok":
-                print(f"  [{video_id} {ratio:.0%}] 轮{n} {kbps}k -> "
-                      f"{rec['actual_MB']:.2f}MB (目标 {rec['target_MB']:.2f}) "
-                      f"err={rec['size_error']:+.1%} PSNR={rec.get('psnr_y_db')} "
-                      f"{rec['next_action']} {enc_time}s")
-            else:
-                print(f"  [{video_id} {ratio:.0%}] 轮{n} 编码失败 rc={rec['returncode']}")
-
-        stop = (failed or n >= config.MAX_ATTEMPTS
-                or rec.get("next_action") in ("accept", "capped", "exhausted"))
-        if stop:
+                history.append((kbps, measured["actual_bytes"]))
+                raw_rate = next_rate(policy, history, bud0["target_bytes"])
+                low, high = kbps * (1 - config.MAX_ADJUST), kbps * (1 + config.MAX_ADJUST)
+                record.update(next_action="retry",
+                              next_kbps=max(50, int(round(min(max(raw_rate, low), high)))),
+                              reason=f"size_error={measured['size_error']:+.4%}")
+        if out.is_file():
+            digest = hashlib.sha256()
+            with out.open("rb") as artifact:
+                for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            record["output_sha256"] = digest.hexdigest()
+        with attempts_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=True) + "\n")
+        attempts.append(record)
+        if record["next_action"] != "retry":
             break
-        kbps = rec["next_kbps"]
+        kbps = record["next_kbps"]
 
     best = pick_best(attempts)
-    total = round(time.perf_counter() - t0, 2)
-
-    summary = {
-        "video_id": video_id,
-        "target_ratio": ratio,
-        "status": "ok" if best else "failed",
-        "attempts": len(attempts),
-        "total_time_s": total,
-        "mode": mode,
-        "motion": plan["motion"],
-        "detail": plan["detail"],
-        "params": plan["params"],
-        "target_bytes": bud0["target_bytes"],
-        "selected_attempt": None,
-    }
+    selected = measurements.get(best["attempt_id"]) if best else None
+    if selected:
+        frame_data = {key: selected[key] for key in ("ms_ssim_per_frame", "psnr_y_per_frame")}
+        frame_data.update(video_id=video_id, group=group, ratio=ratio,
+                          frame_count=len(frame_data["ms_ssim_per_frame"]),
+                          selected_attempt=best["attempt_id"])
+        (run_dir / "perframe" / f"{video_id}_{group}_{int(ratio*100):02d}pct.json").write_text(
+            json.dumps(frame_data, allow_nan=True), encoding="utf-8")
+    summary = {"video_id": video_id, "target_ratio": ratio, "group": group,
+               "status": "ok" if best else "failed",
+               "failure_reason": None if best else "; ".join(
+                   row.get("failure_reason") or row.get("next_action", "") for row in attempts),
+               "attempts": len(attempts), "selected_attempt": best["attempt_id"] if best else None,
+               "total_time_s": time.perf_counter() - started,
+               "encode_time_s": sum(row["encode_time_s"] for row in attempts),
+               "eval_time_s": sum(row.get("eval_time_s", 0) for row in attempts),
+               "agent_time_s": 0,
+               "target_bytes": bud0["target_bytes"], "target_kbps": bud0["video_kbps"],
+               "bpp": bud0["video_kbps"] * 1000 / (meta["width"] * meta["height"] * meta["fps"]),
+               "parameters": json.dumps(params, sort_keys=True), "reasons": "; ".join(reasons)}
     if best:
-        summary.update({
-            "selected_attempt": best["attempt_id"],
-            "actual_bytes": best["actual_bytes"],
-            "actual_MB": best["actual_MB"],
-            "target_MB": best["target_MB"],
-            "size_error": best["size_error"],
-            "ratio_achieved": best["ratio_achieved"],
-            "decode_ok": best.get("decode_ok"),
-            "psnr_y_db": best.get("psnr_y_db"),
-            "duration_s": best.get("duration_s"),
-            "frame_count": best.get("frame_count"),
-            "video_kbps": best.get("video_kbps"),
-            "output_path": best.get("output_path"),
-        })
+        summary.update({key: best["measurements"].get(key) for key in (
+            "actual_bytes", "size_error", "duration_s", "frame_count", "decode_ok", "file_kbps",
+            "psnr_y_db", "ms_ssim", "ms_ssim_db", "ms_ssim_min", "actual_video_kbps")})
+        summary["output_path"] = best["output_path"]
+        digest = hashlib.sha256(Path(best["output_path"]).read_bytes()).hexdigest()
+        summary["output_sha256"] = digest
+    elif attempts and attempts[-1].get("measurements"):
+        summary.update(attempts[-1]["measurements"])
+        summary["output_path"] = attempts[-1].get("output_path")
     return summary

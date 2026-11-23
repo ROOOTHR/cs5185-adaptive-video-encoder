@@ -1,0 +1,2 @@
+﻿dimension,feature,operator,threshold,parameter,value,fallback,source,significant_samples,mean_positive_delta_ms_ssim_db,candidate
+aq-mode,bpp,gt,0.26137514467592593,aq,2,1,sweep_summary.csv,2,0.11939550014968603,aq_mode_2

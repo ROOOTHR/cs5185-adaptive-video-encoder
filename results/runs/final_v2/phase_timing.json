@@ -1,0 +1,5 @@
+{
+  "formal_elapsed_s": 3949.417858300003,
+  "serial": true,
+  "scope": "run setup, source feature extraction, metadata reads, every encode attempt and evaluation, and summary logging"
+}

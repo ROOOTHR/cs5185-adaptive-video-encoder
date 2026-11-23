@@ -1,0 +1,776 @@
+"""Reproducible v2 experiment phases with explicit split guards."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import html
+import importlib.metadata
+import json
+import math
+import os
+import platform
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+from . import config, decide, features, pipeline
+from . import metadata as meta_mod
+from .encode import _exe
+from .ms_ssim import ms_ssim, sample_y_frames
+
+# Pre-registered before scanning: choose by MS-SSIM(dB); a setting is meaningfully
+# better only at +0.10 dB or more while losing no more than 0.30 dB PSNR-Y.
+SIGNIFICANCE_MSSSIM_DB = 0.10
+SIGNIFICANCE_PSNR_DB = -0.30
+PRE_REGISTERED_FEATURES = ("edge_ratio", "mafd", "luma_std", "bpp")
+MAX_RULES = 3
+ANCHOR = dict(decide.ANCHOR)
+
+
+def require_development_ids(ids):
+    ids = list(ids)
+    forbidden = sorted(set(ids) - set(config.DEV_IDS))
+    if forbidden:
+        raise ValueError(f"sweep/derive accepts DEV IDs only; rejected: {', '.join(forbidden)} (TEST is frozen)")
+    if not ids:
+        raise ValueError("at least one DEV video is required")
+    return ids
+
+
+def _run(command: list[str], check=True) -> str:
+    result = subprocess.run(command, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
+    if check and result.returncode:
+        raise RuntimeError(f"command failed ({result.returncode}): {command}\n{result.stderr[-1000:]}")
+    return result.stdout.strip()
+
+
+def _sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Files whose content decides what gets encoded and how it is scored. Orchestration
+# (experiment.py) and reporting (report.py) are deliberately left out so reports can
+# still be improved after the rules are frozen.
+FREEZE_CODE_FILES = ("config.py", "decide.py", "encode.py", "evaluate.py", "features.py",
+                     "metadata.py", "ms_ssim.py", "pipeline.py")
+RULES_PATH = config.ROOT / "src" / "rules_v2.json"
+FINAL_PHASE = "frozen final experiment"
+VAL_PHASE = "VAL rule generalization check"
+
+
+def _normalized_bytes(path: Path) -> bytes:
+    """File bytes with CRLF folded to LF, so a Windows checkout hashes like a Linux one."""
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
+def rules_sha256() -> str:
+    return hashlib.sha256(_normalized_bytes(RULES_PATH) if RULES_PATH.is_file() else b"").hexdigest()
+
+
+def code_sha256() -> str:
+    digest = hashlib.sha256()
+    for name in FREEZE_CODE_FILES:
+        digest.update(name.encode())
+        digest.update(_normalized_bytes(config.ROOT / "src" / name))
+    return digest.hexdigest()
+
+
+def _git(*args: str, check=True) -> str:
+    return _run(["git", "-C", str(config.ROOT), *args], check=check)
+
+
+def create_run(run_name: str) -> Path:
+    if not run_name or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in run_name):
+        raise ValueError("run name may contain only letters, digits, underscore, and hyphen")
+    path = config.RUN_DIR / run_name
+    if path.exists():
+        raise FileExistsError(f"run directory already exists; use a new name: {path}")
+    for part in ("features", "videos", "perframe", "figs", "frames", "clips"):
+        (path / part).mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_run_config(run_dir: Path, phase: str, extra: dict | None = None) -> dict:
+    ffmpeg = _exe("ffmpeg")
+    ffmpeg_version = _run([ffmpeg, "-version"]).splitlines()[0]
+    status = _git("status", "--porcelain", "--untracked-files=normal").splitlines()
+    sources = {}
+    valid = True
+    for vid in config.ALL_IDS:
+        meta = meta_mod.load_meta(vid)
+        video = config.RAW_DIR / meta["file"]
+        metadata_path = config.META_DIR / f"{vid}.json"
+        actual = _sha(video)
+        expected = meta.get("sha256")
+        match = not expected or actual.lower() == expected.lower()
+        sources[vid] = {"video_sha256": actual, "metadata_sha256": _sha(metadata_path),
+                        "expected_video_sha256": expected, "matches_metadata": match}
+        valid &= match
+    packages = {}
+    for name in ("numpy", "opencv-python", "opencv-python-headless", "matplotlib", "imageio-ffmpeg",
+                 "torch", "pytorch-msssim"):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    record = {
+        "phase": phase, "run_name": run_dir.name,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "git_commit": _git("rev-parse", "HEAD"), "git_dirty": bool(status),
+        "git_status": status, "ffmpeg_version": ffmpeg_version,
+        "cpu": platform.processor() or platform.machine(),
+        "logical_cpus": os.cpu_count(), "encode_threads": config.ENCODE_THREADS,
+        "parallelism": 1, "caching_policy": "OS filesystem cache defaults; no application-level cache",
+        "python": sys.version, "packages": packages,
+        "decide_sha256": _sha(config.ROOT / "src" / "decide.py"),
+        "code_sha256": code_sha256(), "rules_sha256": rules_sha256(),
+        "feedback_policy": config.FEEDBACK_POLICY,
+        "dataset_root": str(config.RAW_DIR), "dataset_sha256_valid": bool(valid),
+        "dataset_sha256": sources,
+    }
+    if extra:
+        record.update(extra)
+    (run_dir / "run_config.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not valid:
+        raise ValueError("one or more dataset video hashes do not match the supplied metadata")
+    return record
+
+
+def extract_features(ids, run_dir: Path) -> dict:
+    return features.run_all(list(ids), output_dir=run_dir / "features")
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _read_csv(path: Path) -> list[dict]:
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _variant_rows():
+    definitions = [
+        ("bf_5", "bf", 5, {"bf": 5}), ("bf_8", "bf", 8, {"bf": 8}),
+        ("refs_6", "refs", 6, {"refs": 6}),
+        ("aq_mode_2", "aq-mode", 2, {"aq": 2}), ("aq_mode_3", "aq-mode", 3, {"aq": 3}),
+        ("aq_strength_0.6", "aq-strength", 0.6, {"aq_str": 0.6}),
+        ("aq_strength_1.4", "aq-strength", 1.4, {"aq_str": 1.4}),
+        ("deblock_-1_-1", "deblock", [-1, -1], {"deblock": (-1, -1)}),
+        ("deblock_1_1", "deblock", [1, 1], {"deblock": (1, 1)}),
+        ("psy_rd_0.5", "psy-rd", 0.5, {"psy_rd": 0.5}),
+        ("psy_rd_1.5", "psy-rd", 1.5, {"psy_rd": 1.5}),
+        ("preset_slow", "preset", "slow", {"preset": "slow"}),
+        ("g_60", "g", 60, {"g": 60}),
+    ]
+    return [(name, dimension, value, dict(ANCHOR, **overrides))
+            for name, dimension, value, overrides in definitions]
+
+
+def _base_row(vid: str, ratio: float, candidate: str, dimension: str,
+              value, feat: dict, summary: dict) -> dict:
+    return {"video_id": vid, "ratio": ratio, "candidate": candidate,
+            "dimension": dimension, "setting": json.dumps(value, ensure_ascii=False),
+            "mafd": feat["stats"]["mafd"]["mean"],
+            "edge_ratio": feat["stats"]["edge_ratio"]["mean"],
+            "luma_std": feat["stats"]["luma_std"]["mean"],
+            "bpp": summary["bpp"], **summary}
+
+
+def _heatmap(rows: list[dict], metric: str, output: Path, title: str) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    candidates = ["anchor"] + [item[0] for item in _variant_rows()]
+    keys = sorted({(r["video_id"], float(r["ratio"])) for r in rows})
+    lookup = {(r["video_id"], float(r["ratio"]), r["candidate"]): r for r in rows}
+    def measured(key, candidate):
+        row = lookup.get((*key, candidate), {})
+        return _num(row.get(metric)) if row.get("status") == "ok" else None
+
+    anchor_values = {key: measured(key, "anchor") for key in keys}
+    matrix = np.full((len(keys), len(candidates)), np.nan)
+    for i, key in enumerate(keys):
+        base = anchor_values[key]
+        for j, cand in enumerate(candidates):
+            value = measured(key, cand)
+            if value is not None and base is not None:
+                matrix[i, j] = value - base
+    fig, ax = plt.subplots(figsize=(max(12, 0.65 * len(candidates)), max(6, 0.28 * len(keys))))
+    image = ax.imshow(matrix, aspect="auto", cmap="coolwarm", vmin=-max(0.2, np.nanmax(np.abs(matrix)) if np.isfinite(matrix).any() else 0.2),
+                      vmax=max(0.2, np.nanmax(np.abs(matrix)) if np.isfinite(matrix).any() else 0.2))
+    ax.set_xticks(range(len(candidates)), candidates, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(keys)), [f"{v} {r:.0%}" for v, r in keys], fontsize=8)
+    for i in range(matrix.shape[0]):
+        for j in range(matrix.shape[1]):
+            if np.isfinite(matrix[i, j]):
+                ax.text(j, i, f"{matrix[i,j]:+.2f}", ha="center", va="center", fontsize=6)
+    ax.set_title(title)
+    fig.colorbar(image, ax=ax, label="variant - anchor (dB)")
+    fig.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=170)
+    plt.close(fig)
+
+
+def _num(value):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _sweep_rows(summary_rows: list[dict]) -> list[dict]:
+    lookup = {(row["video_id"], float(row["ratio"]), row["candidate"]): row
+              for row in summary_rows}
+    rows = []
+    for source in summary_rows:
+        row = dict(source)
+        anchor = lookup.get((row["video_id"], float(row["ratio"]), "anchor"), {})
+        eligible = row.get("status") == "ok" and anchor.get("status") == "ok"
+        psnr = _num(row.get("psnr_y_db"))
+        anchor_psnr = _num(anchor.get("psnr_y_db"))
+        msssim = _num(row.get("ms_ssim_db"))
+        anchor_msssim = _num(anchor.get("ms_ssim_db"))
+        delta_psnr = psnr - anchor_psnr if eligible and psnr is not None and anchor_psnr is not None else None
+        delta_msssim = msssim - anchor_msssim if eligible and msssim is not None and anchor_msssim is not None else None
+        row.update(delta_psnr_y_db=delta_psnr, delta_ms_ssim_db=delta_msssim,
+                   significantly_better=bool(delta_msssim is not None and delta_psnr is not None and
+                       delta_msssim >= SIGNIFICANCE_MSSSIM_DB and delta_psnr >= SIGNIFICANCE_PSNR_DB))
+        rows.append(row)
+    return rows
+
+
+def _index(run_dir: Path, title: str) -> None:
+    links = []
+    for filename in ("summary.csv", "sweep_summary.csv", "oracle_summary.csv", "rules.csv", "best_values.csv",
+                     "loocv.csv", "val_check.csv", "comparisons.csv", "subjective_notes.csv", "attempts.jsonl", "run_config.json"):
+        path = run_dir / filename
+        if path.exists():
+            links.append(f'<li><a href="{filename}">{filename}</a></li>')
+    groups = []
+    for folder in ("figs", "frames", "clips"):
+        directory = run_dir / folder
+        if directory.exists():
+            for path in sorted(directory.glob("*")):
+                rel = path.relative_to(run_dir).as_posix()
+                if path.suffix.lower() in (".png", ".jpg", ".svg"):
+                    groups.append(f'<figure><a href="{html.escape(rel)}"><img src="{html.escape(rel)}" style="max-width:900px"></a><figcaption>{html.escape(path.name)}</figcaption></figure>')
+                elif path.suffix.lower() == ".mp4":
+                    groups.append(f'<figure><video controls preload="none" src="{html.escape(rel)}"></video><figcaption>{html.escape(path.name)}</figcaption></figure>')
+    text = f'<!doctype html><meta charset="utf-8"><title>{html.escape(title)}</title><h1>{html.escape(title)}</h1><ul>{"".join(links)}</ul>{"".join(groups)}'
+    (run_dir / "index.html").write_text(text, encoding="utf-8")
+
+
+def run_features(run_name: str = "features_v2") -> Path:
+    run_dir = create_run(run_name)
+    write_run_config(run_dir, "features")
+    extract_features(config.ALL_IDS, run_dir)
+    _index(run_dir, f"{run_name}: dataset features")
+    return run_dir
+
+
+def sweep(run_name: str) -> Path:
+    ids = require_development_ids(config.DEV_IDS)
+    run_dir = create_run(run_name)
+    write_run_config(run_dir, "development sweep")
+    feature_map = extract_features(ids, run_dir)
+    candidates = [("anchor", "anchor", "anchor", dict(ANCHOR))] + [
+        (name, dimension, value, params) for name, dimension, value, params in _variant_rows()]
+    summary_rows, attempt_rows = [], []
+    total_jobs = len(ids) * len(config.RATIOS) * len(candidates)
+    job_index = 0
+    for vid in ids:
+        feat = feature_map[vid]
+        meta = meta_mod.load_meta(vid)
+        for ratio in config.RATIOS:
+            for candidate, dimension, value, params in candidates:
+                job_index += 1
+                print(f"[{job_index}/{total_jobs}] {vid} {ratio:.0%} {candidate}", flush=True)
+                summary = pipeline.run_candidate(vid, ratio, candidate, params, feat, meta, run_dir)
+                summary_rows.append(_base_row(vid, ratio, candidate, dimension, value, feat, summary))
+    sweep_rows = _sweep_rows(summary_rows)
+    _write_csv(run_dir / "summary.csv", summary_rows)
+    _write_csv(run_dir / "sweep_summary.csv", sweep_rows)
+    figs = run_dir / "figs"
+    _heatmap(sweep_rows, "ms_ssim_db", figs / "sweep_heatmap_msssim.png", "DEV sweep: ΔMS-SSIM(dB) from anchor")
+    _heatmap(sweep_rows, "psnr_y_db", figs / "sweep_heatmap_psnr.png", "DEV sweep: ΔPSNR-Y(dB) from anchor")
+    _index(run_dir, f"{run_name}: DEV sweep")
+    return run_dir
+
+
+def _feature(row: dict, name: str) -> float:
+    return float(row[name])
+
+
+def _separator(samples: list[dict], labels: list[bool], name: str):
+    values = sorted(set(_feature(row, name) for row in samples))
+    for left, right in zip(values, values[1:]):
+        threshold = (left + right) / 2
+        high = [_feature(row, name) > threshold for row in samples]
+        if high == labels:
+            return {"feature": name, "operator": "gt", "threshold": threshold}
+        low = [_feature(row, name) <= threshold for row in samples]
+        if low == labels:
+            return {"feature": name, "operator": "le", "threshold": threshold}
+    return None
+
+
+def derive_rules(rows: list[dict], max_rules: int = MAX_RULES) -> list[dict]:
+    samples = sorted({(r["video_id"], float(r["ratio"])) for r in rows})
+    by_key = {(r["video_id"], float(r["ratio"]), r["candidate"]): r for r in rows}
+    qualified = []
+    for dimension in (x[1] for x in _variant_rows()):
+        parameter = decide.PARAMETERS[dimension]
+        settings = [(name, value) for name, dim, value, _ in _variant_rows() if dim == dimension]
+        for candidate, value in settings:
+            trials = [by_key.get((vid, ratio, candidate)) for vid, ratio in samples]
+            anchors = [by_key.get((vid, ratio, "anchor")) for vid, ratio in samples]
+            pairs = [(t, a) for t, a in zip(trials, anchors)
+                     if t is not None and a is not None and t.get("status") == "ok" and
+                     a.get("status") == "ok" and all(_num(row.get(metric)) is not None
+                         for row in (t, a) for metric in ("ms_ssim_db", "psnr_y_db"))]
+            if not pairs:
+                continue
+            trials, anchors = map(list, zip(*pairs))
+            labels = [(float(t["ms_ssim_db"]) - float(a["ms_ssim_db"]) >= SIGNIFICANCE_MSSSIM_DB and
+                       float(t["psnr_y_db"]) - float(a["psnr_y_db"]) >= SIGNIFICANCE_PSNR_DB)
+                      for t, a in zip(trials, anchors)]
+            if not any(labels) or all(labels):
+                continue
+            sample_rows = [dict(t) for t in trials]
+            for feature_name in PRE_REGISTERED_FEATURES:
+                separator = _separator(sample_rows, labels, feature_name)
+                if not separator:
+                    continue
+                positive = sum(labels)
+                mean_delta = float(np.mean([float(t["ms_ssim_db"]) - float(a["ms_ssim_db"])
+                                            for t, a, label in zip(trials, anchors, labels) if label]))
+                qualified.append({"dimension": dimension, "feature": separator["feature"],
+                    "operator": separator["operator"], "threshold": separator["threshold"],
+                    "parameter": parameter, "value": value, "fallback": ANCHOR[parameter],
+                    "source": "sweep_summary.csv", "significant_samples": positive,
+                    "mean_positive_delta_ms_ssim_db": mean_delta, "candidate": candidate})
+    qualified.sort(key=lambda rule: (-rule["significant_samples"],
+                                     -rule["mean_positive_delta_ms_ssim_db"], rule["dimension"]))
+    chosen = []
+    for rule in qualified:
+        if rule["dimension"] not in {r["dimension"] for r in chosen}:
+            chosen.append(rule)
+        if len(chosen) == max_rules:
+            break
+    return chosen
+
+
+def _same_value(a, b):
+    if isinstance(a, list):
+        a = tuple(a)
+    if isinstance(b, list):
+        b = tuple(b)
+    return a == b
+
+
+def _apply_rules(feat_row: dict, rules: list[dict], dimension: str, bpp: float):
+    parameter = decide.PARAMETERS[dimension]
+    value = ANCHOR[parameter]
+    for rule in rules:
+        if rule["dimension"] != dimension:
+            continue
+        observed = bpp if rule["feature"] == "bpp" else float(feat_row[rule["feature"]])
+        match = observed > float(rule["threshold"]) if rule["operator"] == "gt" else observed <= float(rule["threshold"])
+        value = rule["value"] if match else rule["fallback"]
+    return value
+
+
+def derive(run_name: str) -> dict:
+    run_dir = config.RUN_DIR / run_name
+    if not run_dir.is_dir():
+        raise FileNotFoundError(run_dir)
+    raw = _read_csv(run_dir / "summary.csv")
+    # Rebuild analytical deltas using only candidates that passed every integrity check.
+    require_development_ids(sorted({row["video_id"] for row in raw}))
+    sweep_rows = _sweep_rows(raw)
+    _write_csv(run_dir / "sweep_summary.csv", sweep_rows)
+    figs = run_dir / "figs"
+    _heatmap(sweep_rows, "ms_ssim_db", figs / "sweep_heatmap_msssim.png", "DEV sweep: ΔMS-SSIM(dB) from anchor")
+    _heatmap(sweep_rows, "psnr_y_db", figs / "sweep_heatmap_psnr.png", "DEV sweep: ΔPSNR-Y(dB) from anchor")
+    rules = derive_rules(sweep_rows)
+    rules_path = config.ROOT / "src" / "rules_v2.json"
+    rules_path.write_text(json.dumps({"pre_registered": {
+        "metric": "delta_ms_ssim_db", "significance_ms_ssim_db": SIGNIFICANCE_MSSSIM_DB,
+        "minimum_delta_psnr_y_db": SIGNIFICANCE_PSNR_DB, "features": list(PRE_REGISTERED_FEATURES),
+        "max_rules": MAX_RULES}, "source_sweep_run": run_name, "rules": rules},
+        indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_csv(run_dir / "rules.csv", rules)
+    oracle_rows = []
+    by_pair = {}
+    for row in sweep_rows:
+        if row["status"] == "ok" and _num(row.get("ms_ssim_db")) is not None:
+            by_pair.setdefault((row["video_id"], float(row["ratio"])), []).append(row)
+    for (vid, ratio), candidates in sorted(by_pair.items()):
+        oracle = max(candidates, key=lambda row: (float(row["ms_ssim_db"]), float(row.get("psnr_y_db") or -1e9)))
+        oracle_rows.append({"video_id": vid, "ratio": ratio, "group": "Oracle",
+                            "chosen_sweep_candidate": oracle["candidate"],
+                            "chosen_dimension": oracle["dimension"], "chosen_setting": oracle["setting"],
+                            "ms_ssim_db": oracle["ms_ssim_db"], "psnr_y_db": oracle["psnr_y_db"],
+                            "size_error": oracle["size_error"], "output_path": oracle["output_path"]})
+    _write_csv(run_dir / "oracle_summary.csv", oracle_rows)
+    _write_best_values_and_loocv(sweep_rows, run_dir, rules)
+    _index(run_dir, f"{run_name}: DEV scan and frozen derivation")
+    return {"rules": rules, "path": rules_path}
+
+
+def _write_best_values_and_loocv(rows: list[dict], run_dir: Path, full_rules: list[dict]) -> None:
+    dimensions = list(dict.fromkeys(dim for _, dim, _, _ in _variant_rows()))
+    by_key = {(r["video_id"], float(r["ratio"]), r["candidate"]): r for r in rows}
+    keys = sorted({(r["video_id"], float(r["ratio"])) for r in rows})
+    best_rows = []
+    for vid, ratio in keys:
+        for dimension in dimensions:
+            candidates = [("anchor", "anchor", ANCHOR)] + [
+                (name, dim, dict(ANCHOR, **overrides))
+                for name, dim, _, overrides in _variant_rows() if dim == dimension]
+            available = [by_key[(vid, ratio, name)] for name, _, _ in candidates
+                         if (vid, ratio, name) in by_key and by_key[(vid, ratio, name)].get("status") == "ok" and
+                         _num(by_key[(vid, ratio, name)].get("ms_ssim_db")) is not None]
+            if not available:
+                continue
+            best = max(available, key=lambda row: (float(row["ms_ssim_db"]), float(row.get("psnr_y_db") or -1e9)))
+            chosen_params = next((params for name, _, params in candidates if name == best["candidate"]), ANCHOR)
+            best_rows.append({"video_id": vid, "ratio": ratio, "dimension": dimension,
+                              "best_candidate": best["candidate"], "best_value": json.dumps(chosen_params[decide.PARAMETERS[dimension]]),
+                              "ms_ssim_db": best["ms_ssim_db"], "psnr_y_db": best["psnr_y_db"],
+                              **{f: best[f] for f in PRE_REGISTERED_FEATURES}})
+    _write_csv(run_dir / "best_values.csv", best_rows)
+    loocv = []
+    ids = sorted({r["video_id"] for r in rows})
+    for held_out in ids:
+        train = [r for r in rows if r["video_id"] != held_out]
+        require_development_ids({r["video_id"] for r in train})
+        fold_rules = derive_rules(train)
+        for sample in (r for r in rows if r["video_id"] == held_out and r["candidate"] == "anchor" and
+                       r.get("status") == "ok"):
+            ratio = float(sample["ratio"])
+            for dimension in dimensions:
+                parameter = decide.PARAMETERS[dimension]
+                predicted = _apply_rules(sample, fold_rules, dimension, float(sample["bpp"]))
+                options = [(r, json.loads(r["parameters"]).get(parameter)) for r in rows
+                           if r["video_id"] == held_out and float(r["ratio"]) == ratio and
+                           (r["dimension"] == dimension or r["candidate"] == "anchor") and
+                           r.get("status") == "ok" and _num(r.get("ms_ssim_db")) is not None]
+                if not options:
+                    continue
+                oracle_row, oracle_value = max(options, key=lambda pair: (float(pair[0]["ms_ssim_db"]), float(pair[0].get("psnr_y_db") or -1e9)))
+                predicted_row = next((r for r, value in options if _same_value(value, predicted)), None)
+                loocv.append({"held_out_video": held_out, "ratio": ratio, "dimension": dimension,
+                              "predicted_value": json.dumps(predicted), "oracle_value": json.dumps(oracle_value),
+                              "prediction_equal_oracle": _same_value(predicted, oracle_value),
+                              "predicted_ms_ssim_db": predicted_row["ms_ssim_db"] if predicted_row else "",
+                              "oracle_ms_ssim_db": oracle_row["ms_ssim_db"],
+                              "ms_ssim_loss_db": float(oracle_row["ms_ssim_db"]) - float(predicted_row["ms_ssim_db"]) if predicted_row else ""})
+    _write_csv(run_dir / "loocv.csv", loocv)
+    _plot_best_values(best_rows, run_dir / "figs")
+
+
+def _plot_best_values(rows: list[dict], figdir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    figdir.mkdir(parents=True, exist_ok=True)
+    for dimension in dict.fromkeys(r["dimension"] for r in rows):
+        subset = [r for r in rows if r["dimension"] == dimension]
+        fig, axes = plt.subplots(2, 2, figsize=(10, 7))
+        for ax, feature_name in zip(axes.ravel(), PRE_REGISTERED_FEATURES):
+            x = [float(r[feature_name]) for r in subset]
+            settings = sorted({r["best_value"] for r in subset})
+            setting_y = {value: index for index, value in enumerate(settings)}
+            y = [setting_y[r["best_value"]] for r in subset]
+            ax.scatter(x, y, alpha=0.8)
+            for row, xx, yy in zip(subset, x, y):
+                ax.annotate(f"{row['video_id'][-2:]} {float(row['ratio']):.0%}", (xx, yy), fontsize=6)
+            ax.set_xlabel(feature_name)
+            ax.set_ylabel(f"best {dimension} setting")
+            ax.set_yticks(range(len(settings)), settings)
+            ax.grid(alpha=0.2)
+        fig.suptitle(f"DEV oracle setting vs pre-registered features: {dimension}")
+        fig.tight_layout()
+        fig.savefig(figdir / f"oracle_{dimension.replace('-', '_')}.png", dpi=150)
+        plt.close(fig)
+
+
+def _load_rules(path: Path | None = None) -> list[dict]:
+    path = path or config.ROOT / "src" / "rules_v2.json"
+    if not path.is_file():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))["rules"]
+
+
+def validate(run_name: str, rules_path: Path | None = None) -> Path:
+    run_dir = create_run(run_name)
+    write_run_config(run_dir, VAL_PHASE)
+    rule_list = _load_rules(rules_path)
+    feature_map = extract_features(config.VAL_IDS, run_dir)
+    rows = []
+    for vid in config.VAL_IDS:
+        feat, meta = feature_map[vid], meta_mod.load_meta(vid)
+        for ratio in config.RATIOS:
+            bud = meta_mod.budget(meta, ratio)
+            bpp = bud["video_kbps"] * 1000 / (meta["width"] * meta["height"] * meta["fps"])
+            for group in ("B1", "A"):
+                plan = decide.decide(feat, bud, group, rule_list, bpp)
+                result = pipeline.run_candidate(vid, ratio, group, plan["params"], feat, meta, run_dir,
+                                                reasons=plan["reasons"])
+                result.update(video_id=vid, ratio=ratio, group=group, reasons="; ".join(plan["reasons"]))
+                rows.append(result)
+    paired = {(r["video_id"], float(r["target_ratio"]), r["group"]): r for r in rows}
+    for row in rows:
+        baseline = paired.get((row["video_id"], float(row["target_ratio"]), "B1"), {})
+        if row["group"] == "A" and row.get("status") == "ok" and baseline.get("status") == "ok":
+            row["delta_psnr_y_db"] = float(row["psnr_y_db"]) - float(baseline["psnr_y_db"])
+            row["delta_ms_ssim_db"] = float(row["ms_ssim_db"]) - float(baseline["ms_ssim_db"])
+    _write_csv(run_dir / "val_check.csv", rows)
+    _write_csv(run_dir / "summary.csv", rows)
+    _index(run_dir, f"{run_name}: VAL-only rule check")
+    return run_dir
+
+
+def final_guard(val_run: str) -> dict:
+    """Freeze check for the one-shot TEST pass; no git tag involved.
+
+    The rules and the code that selects and scores encodes are frozen by the VAL run:
+    validate() records their hashes, and final() refuses to start unless the current
+    files still hash the same, and no completed final run exists for that frozen state.
+    """
+    val_dir = config.RUN_DIR / val_run
+    config_path, check_path = val_dir / "run_config.json", val_dir / "val_check.csv"
+    if not config_path.is_file() or not check_path.is_file():
+        raise RuntimeError(f"final requires a completed VAL run (run `validate --run {val_run}` first)")
+    recorded = json.loads(config_path.read_text(encoding="utf-8"))
+    if recorded.get("phase") != VAL_PHASE:
+        raise RuntimeError(f"{val_run} is not a VAL run (phase={recorded.get('phase')!r})")
+    if not recorded.get("dataset_sha256_valid"):
+        raise RuntimeError(f"{val_run} was run on a dataset that did not match its metadata hashes")
+    recorded_policy = recorded.get("feedback_policy", "proportional")  # runs before the option existed
+    if recorded_policy != config.FEEDBACK_POLICY:
+        raise RuntimeError(f"feedback policy is {config.FEEDBACK_POLICY!r} but VAL run {val_run} used "
+                           f"{recorded_policy!r}; the TEST pass must use the same rule")
+    frozen = {"val_run": val_run, "rules_sha256": rules_sha256(), "code_sha256": code_sha256()}
+    for key in ("rules_sha256", "code_sha256"):
+        if recorded.get(key) != frozen[key]:
+            raise RuntimeError(f"{key.split('_')[0]} changed after the VAL run {val_run}; "
+                               "re-run `validate` so the TEST pass uses exactly what VAL checked")
+    for other in sorted(config.RUN_DIR.glob("*/run_config.json")):
+        done = json.loads(other.read_text(encoding="utf-8"))
+        if (done.get("phase") == FINAL_PHASE and done.get("rules_sha256") == frozen["rules_sha256"]
+                and done.get("code_sha256") == frozen["code_sha256"]
+                and (other.parent / "summary.csv").is_file()):
+            raise RuntimeError(f"TEST was already run once for this frozen rule set: {other.parent.name}")
+    return frozen
+
+
+def final(run_name: str, val_run: str) -> Path:
+    frozen = final_guard(val_run)
+    phase_started = time.perf_counter()
+    run_dir = create_run(run_name)
+    write_run_config(run_dir, FINAL_PHASE, extra={"freeze": frozen})
+    rule_list = _load_rules()
+    feature_map = extract_features(config.ALL_IDS, run_dir)
+    rows = []
+    total = len(config.ALL_IDS) * len(config.RATIOS) * 3
+    index = 0
+    for vid in config.ALL_IDS:
+        feat, meta = feature_map[vid], meta_mod.load_meta(vid)
+        for ratio in config.RATIOS:
+            bud = meta_mod.budget(meta, ratio)
+            bpp = bud["video_kbps"] * 1000 / (meta["width"] * meta["height"] * meta["fps"])
+            for group in ("B0", "B1", "A"):
+                index += 1
+                plan = decide.decide(feat, bud, group, rule_list, bpp)
+                print(f"[{index}/{total}] {vid} {ratio:.0%} {group}", flush=True)
+                result = pipeline.run_candidate(vid, ratio, group, plan["params"], feat, meta,
+                                                run_dir, reasons=plan["reasons"])
+                result.update(video_id=vid, ratio=ratio, group=group,
+                              mafd=feat["stats"]["mafd"]["mean"],
+                              edge_ratio=feat["stats"]["edge_ratio"]["mean"],
+                              luma_std=feat["stats"]["luma_std"]["mean"],
+                              reasons="; ".join(plan["reasons"]))
+                rows.append(result)
+    _write_csv(run_dir / "summary.csv", rows)
+    elapsed = time.perf_counter() - phase_started
+    (run_dir / "phase_timing.json").write_text(json.dumps({
+        "formal_elapsed_s": elapsed, "serial": True,
+        "scope": "run setup, source feature extraction, metadata reads, every encode attempt and evaluation, and summary logging"
+    }, indent=2), encoding="utf-8")
+    _index(run_dir, f"{run_name}: frozen final experiment")
+    return run_dir
+
+MSSSIM_HINT = ("pytorch-msssim reference not found. Create a venv with CPU torch + pytorch-msssim "
+               "(see requirements-align.txt) and point CS5185_MSSSIM_PYTHON at its python, "
+               "or place it at <repo parent>/_venv_msssim.")
+
+
+def _msssim_python() -> Path | None:
+    """Interpreter that has torch + pytorch-msssim, or None (the alignment check is optional)."""
+    override = os.environ.get("CS5185_MSSSIM_PYTHON")
+    if override:
+        return Path(override) if Path(override).is_file() else None
+    scripts = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+    venv_python = config.ROOT.parent / "_venv_msssim" / scripts
+    if venv_python.is_file():
+        return venv_python
+    import importlib.util
+    if importlib.util.find_spec("torch") and importlib.util.find_spec("pytorch_msssim"):
+        return Path(sys.executable)
+    return None
+
+
+def alignment_check(sweep_run: str, output_root: Path | None = None) -> Path:
+    source_run = config.RUN_DIR / sweep_run
+    if not (source_run / "sweep_summary.csv").is_file():
+        raise FileNotFoundError(source_run / "sweep_summary.csv")
+    output_root = output_root or (source_run / "checks")
+    output_root.mkdir(parents=True, exist_ok=True)
+    check_dir = output_root / "msssim_alignment"
+    python = _msssim_python()
+    if python is None:
+        raise RuntimeError(MSSSIM_HINT)
+    check_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(5185)
+    selected = [("01_FourPeople", 0.05), ("02_Beauty", 0.05), ("03_Bosphorus", 0.05)]
+    first_meta = meta_mod.load_meta(selected[0][0])
+    _, first_frames = sample_y_frames(config.RAW_DIR / first_meta["file"], first_meta["width"],
+                                      first_meta["height"], first_meta["frames"], 1)
+    reference = first_frames[0]
+    noise = rng.normal(0, 1, reference.shape)
+    self_score = ms_ssim(reference, reference)
+    noisy_scores = [ms_ssim(reference, np.clip(reference.astype(float) + noise * level, 0, 255).astype(np.uint8))
+                    for level in (1, 2, 5, 10)]
+    assert self_score == 1.0, f"self comparison is {self_score}"
+    strictly_monotonic = all(a > b for a, b in zip([self_score] + noisy_scores, noisy_scores))
+    assert strictly_monotonic, noisy_scores
+    alignment_rows = []
+    for vid, ratio in selected:
+        summary_path = source_run / "summary.csv"
+        summaries = _read_csv(summary_path)
+        row = next((item for item in summaries if item["video_id"] == vid and
+                    float(item["ratio"]) == ratio and item["candidate"] == "anchor" and item["status"] == "ok"), None)
+        if row is None:
+            raise ValueError(f"no successful anchor candidate for {vid} {ratio:.0%}")
+        meta = meta_mod.load_meta(vid)
+        indices, original = sample_y_frames(config.RAW_DIR / meta["file"], meta["width"], meta["height"], meta["frames"], 10)
+        _, encoded = sample_y_frames(row["output_path"], meta["width"], meta["height"], meta["frames"], 10)
+        ours = [ms_ssim(a, b) for a, b in zip(original, encoded)]
+        npz = check_dir / f"{vid}.npz"
+        np.savez(npz, reference=np.stack(original), distorted=np.stack(encoded))
+        torch_result = check_dir / f"{vid}_torch.json"
+        helper = config.ROOT / "tools" / "msssim_reference.py"
+        _run([str(python), str(helper), str(npz), str(torch_result)])
+        reference_result = json.loads(torch_result.read_text(encoding="utf-8"))
+        for idx, ours_value, reference_value in zip(indices, ours, reference_result["values"]):
+            alignment_rows.append({"video_id": vid, "ratio": ratio, "frame_index": idx,
+                "ours": ours_value, "pytorch_msssim": reference_value,
+                "absolute_difference": abs(ours_value - reference_value),
+                "torch_version": reference_result["torch"],
+                "pytorch_msssim_version": reference_result["pytorch_msssim"]})
+    alignment_path = output_root / "msssim_alignment.csv"
+    _write_csv(alignment_path, alignment_rows)
+    max_difference = max(row["absolute_difference"] for row in alignment_rows)
+    (output_root / "msssim_alignment_basic.json").write_text(json.dumps({
+        "self_comparison": self_score, "noise_levels": [1, 2, 5, 10],
+        "noise_scores": [1.0] + noisy_scores,
+        "strictly_monotonic_decrease": strictly_monotonic,
+        "alignment_samples": len(alignment_rows), "max_absolute_difference": max_difference,
+        "torch_version": alignment_rows[0]["torch_version"],
+        "pytorch_msssim_version": alignment_rows[0]["pytorch_msssim_version"]}, indent=2), encoding="utf-8")
+    if max_difference > 1e-4:
+        raise ValueError(f"MS-SSIM reference alignment exceeds 1e-4: {max_difference}")
+    return alignment_path
+
+
+def over_target_check(run_name: str) -> Path:
+    """E3 check: force an over-target first pass and confirm the retry. Kept out of formal runs."""
+    check_root = config.CHECK_DIR / run_name
+    if check_root.exists():
+        raise FileExistsError(f"check directory already exists; use a new name: {check_root}")
+    check_root.mkdir(parents=True)
+    vid, ratio = config.DEV_IDS[0], 0.05
+    meta = meta_mod.load_meta(vid)
+    feat = features.extract(config.RAW_DIR / meta["file"])
+    base = meta_mod.budget(meta, ratio)
+    attempts = []
+    triggered = None
+    for multiplier in (1.15, 1.30, 1.60, 2.00):
+        trial_dir = check_root / f"rate_{round(multiplier * 100)}pct"
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        (trial_dir / "perframe").mkdir(exist_ok=True)
+        plan = decide.decide(feat, base, "B1", [])
+        result = pipeline.run_candidate(vid, ratio, f"E3_{round(multiplier*100)}", plan["params"], feat,
+                                        meta, trial_dir, initial_kbps=round(base["video_kbps"] * multiplier),
+                                        reasons=plan["reasons"])
+        log = trial_dir / "attempts.jsonl"
+        records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        first = records[0]
+        attempts.append({"video_id": vid, "ratio": ratio, "initial_multiplier": multiplier,
+                         "initial_kbps": first["planned_kbps"],
+                         "first_actual_bytes": first.get("measurements", {}).get("actual_bytes"),
+                         "first_size_error": first.get("measurements", {}).get("size_error"),
+                         "first_next_action": first["next_action"],
+                         "retry_triggered": first["next_action"] == "retry",
+                         "attempt_count": result["attempts"], "final_status": result["status"]})
+        if first["next_action"] == "retry" and first.get("measurements", {}).get("size_error", -1) > 0:
+            triggered = attempts[-1]
+            break
+    _write_csv(check_root / "over_target_retry.csv", attempts)
+    if not triggered:
+        raise RuntimeError("E3 check did not produce an over-target first pass; see check CSV")
+    return check_root / "over_target_retry.csv"
+
+
+def run_all(prefix: str) -> Path:
+    """Whole pipeline in order: features -> DEV sweep -> rules -> (align) -> VAL -> freeze -> TEST -> report.
+
+    Every stage gets its own run directory named <prefix>_<stage>; nothing existing is overwritten.
+    The freeze is implicit: `final` only starts if rules and selection code still match what VAL checked.
+    """
+    from . import report as report_module
+    names = {stage: f"{prefix}_{stage}" for stage in ("features", "sweep", "val", "final", "retry")}
+    for name in names.values():
+        if (config.RUN_DIR / name).exists() or (config.CHECK_DIR / name).exists():
+            raise FileExistsError(f"{name} already exists; choose a different prefix")
+    print(f"[1/8] retry check -> {names['retry']}", flush=True)
+    over_target_check(names["retry"])
+    print("[2/8] features", flush=True)
+    run_features(names["features"])
+    print("[3/8] DEV sweep", flush=True)
+    sweep(names["sweep"])
+    print("[4/8] derive rules (DEV only)", flush=True)
+    derive(names["sweep"])
+    print("[5/8] MS-SSIM alignment", flush=True)
+    if _msssim_python() is None:
+        print("      skipped: " + MSSSIM_HINT, flush=True)
+    else:
+        alignment_check(names["sweep"])
+    print("[6/8] VAL check", flush=True)
+    validate(names["val"])
+    print("[7/8] TEST (frozen, once)", flush=True)
+    run_dir = final(names["final"], names["val"])
+    print("[8/8] report", flush=True)
+    report_module.generate(names["final"])
+    return run_dir

@@ -1,0 +1,21 @@
+{
+  "self_comparison": 1.0,
+  "noise_levels": [
+    1,
+    2,
+    5,
+    10
+  ],
+  "noise_scores": [
+    1.0,
+    0.9988004966071398,
+    0.9955697166324793,
+    0.9756725641847419,
+    0.9257351783982883
+  ],
+  "strictly_monotonic_decrease": true,
+  "alignment_samples": 30,
+  "max_absolute_difference": 1.8034227472485398e-06,
+  "torch_version": "2.15.0+cpu",
+  "pytorch_msssim_version": "1.0.0"
+}
