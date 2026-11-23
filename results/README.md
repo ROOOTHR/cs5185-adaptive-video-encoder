@@ -43,3 +43,35 @@ results/
 
 命令序列见 `docs/experiment_v2.md` 第 2 节。重新运行会在 `results/runs/<新名字>/` 下生成同样结构的目录，
 其中 `videos/` 自动被 `.gitignore` 排除，不需要再改忽略规则。
+
+## 附：仓库整体目录结构
+
+```
+cs5185-adaptive-video-encoder/
+├── run.py                    命令行入口
+├── requirements.txt          主流程依赖（实际使用的版本）
+├── requirements-align.txt    可选：MS-SSIM 对齐校验用的独立环境
+├── src/
+│   ├── config.py             路径、常量、数据划分、反馈策略
+│   ├── metadata.py           元数据读取与预算公式
+│   ├── features.py           内容特征
+│   ├── decide.py             规则驱动的参数决策与 FFmpeg 命令
+│   ├── encode.py             两遍编码、解码检查
+│   ├── evaluate.py           体积、完整性、PSNR、MS-SSIM 验收
+│   ├── ms_ssim.py            MS-SSIM 实现（Y 通道，5 尺度）
+│   ├── pipeline.py           单个候选的反馈环（含三种修正规则）
+│   ├── experiment.py         各阶段编排、划分与冻结检查、all
+│   ├── report.py             图、三联帧、并排短片、HTML
+│   └── rules_v2.json         DEV 推导出的规则
+├── tests/                    19 个测试（决策规则、冻结检查、反馈策略）
+├── tools/                    反馈策略实验脚本、pytorch-msssim 对齐助手
+├── docs/
+│   ├── experiment_v2.md      v2 实验报告
+│   ├── pitfalls.md           踩过的坑及 v2 的状态
+│   └── feedback_experiment.md  反馈策略实验
+├── results/                  实验结果与证据（本文上半部分）
+├── archive/v1_logs/          v1 的逐轮日志
+└── _diag/                    v1 阶段的诊断脚本（历史遗留）
+```
+
+怎么查看和分析这些结果，见根目录 `README.md` 的“如何查看和分析结果”。
