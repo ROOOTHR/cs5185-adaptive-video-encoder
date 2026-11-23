@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import sys
 
-from src import config, experiment
+from src import config, experiment, pipeline
 
 
 def main():
     parser = argparse.ArgumentParser(description="CS5185 v2 adaptive video encoding")
+    parser.add_argument("--feedback-policy", choices=pipeline.POLICIES, default=None,
+                        help="size-retry rule (default: proportional, or $CS5185_FEEDBACK_POLICY)")
     commands = parser.add_subparsers(dest="command", required=True)
     features = commands.add_parser("features", help="extract source features; includes TEST only for reporting")
     features.add_argument("--run", default="features_v2")
@@ -30,6 +32,10 @@ def main():
     report = commands.add_parser("report", help="build figures and TEST subjective materials")
     report.add_argument("--run", required=True, help="final run to build the report for")
     args = parser.parse_args()
+    if args.feedback_policy:
+        config.FEEDBACK_POLICY = args.feedback_policy
+    if config.FEEDBACK_POLICY not in pipeline.POLICIES:
+        parser.error(f"unknown feedback policy: {config.FEEDBACK_POLICY}")
 
     try:
         if args.command == "features":

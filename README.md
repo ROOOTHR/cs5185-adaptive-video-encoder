@@ -52,6 +52,18 @@ python run.py report --run r1_final
 
 > 重新跑出的数字会和入库的 `*_v2` 略有不同：多线程 x264 不是逐字节确定的，`derive` 也可能推出不同的规则。入库的 `*_v2` 结果是首次正式运行，历史上是在 git 标签 `frozen-v2`（commit `55516859a134dfbdf64a5811a33ed9a344fb9820`）上由旧版的标签检查把关；该标签现已移除，commit 仍在 `v2` 分支历史中，`results/runs/final_v2/run_config.json` 也记录了它。
 
+### 可选：反馈策略 `center`
+
+```powershell
+python run.py --feedback-policy center all --prefix r1     # 或设置环境变量 CS5185_FEEDBACK_POLICY=center
+```
+
+默认策略是 `proportional`，不加选项时行为不变。启用 `center` 解决的问题：默认的比例修正把“目标体积”本身当作瞄准点，首轮偏低时下一轮容易冲过窗口上沿（超过目标体积），再回调，白白多用重试轮数。`center` 把瞄准点改为验收窗口 −3%..0 的中点（0.985 × 目标体积），其余逻辑不变。
+
+在开发集和验证集 48 个任务 × 3 次重复的对比里（[`docs/feedback_experiment.md`](docs/feedback_experiment.md)），需要 3 轮以上的任务从 35 个降到 2 个，平均尝试轮数从 1.81 降到 1.57；通过率没有可区分的差别，也不是靠多花预算换来的（通过任务的平均体积误差 −1.66% 对 −1.70%）。它不能解决体积响应本身不稳定的格子（例如 08_Shields 2%），那类格子在各个策略下都会偶尔失败。`secant`（割线法）也可选，实验里没有比 `center` 更好。
+
+每次运行的 `run_config.json` 记录所用策略，`final` 要求与对应 VAL 运行所用的策略一致。
+
 ## 实验结果与交付
 
 - DEV 扫描：168 候选，164 通过；唯一规则是预算相关 bpp 规则，纯运动/纹理规则没有数据支持。
@@ -71,6 +83,7 @@ python run.py report --run r1_final
 - `validate --run <name>`：VAL-only 检查，不调参。
 - `final --run <name> --val <val-run>`：TEST 一次性正式实验，串行运行 12×2×{B0,B1,A}；规则或选参代码在 VAL 之后改动、或同一冻结状态已跑过 TEST，都会被拒绝。
 - `all --prefix <name>`：按顺序执行上面所有步骤。
+- `--feedback-policy {proportional,center,secant}`（写在子命令之前）：体积重试的修正规则，默认 `proportional`。
 - `report --run <name>`：图、TEST 主观材料、CSV 和 HTML。
 - `align-check --run <sweep-name>` / `check-retry --run <name>`：独立 E1/E3 检查；结果写在 `results/runs/<sweep-name>/checks/` 和 `results/checks/<name>/`，不覆盖已入库的检查结果。
 

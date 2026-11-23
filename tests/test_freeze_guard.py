@@ -61,3 +61,24 @@ def test_a_non_val_run_cannot_freeze(runs):
     (runs / "sweep" / "val_check.csv").write_text("x")
     with pytest.raises(RuntimeError, match="not a VAL run"):
         experiment.final_guard("sweep")
+
+
+def test_final_refuses_a_different_feedback_policy_than_val(runs, monkeypatch):
+    monkeypatch.setattr(config, "FEEDBACK_POLICY", "proportional")
+    run = make_run(runs, "val", experiment.VAL_PHASE)
+    record = json.loads((run / "run_config.json").read_text())
+    record["feedback_policy"] = "center"
+    (run / "run_config.json").write_text(json.dumps(record))
+    with pytest.raises(RuntimeError, match="feedback policy"):
+        experiment.final_guard("val")
+    monkeypatch.setattr(config, "FEEDBACK_POLICY", "center")
+    assert experiment.final_guard("val")["val_run"] == "val"
+
+
+def test_val_runs_from_before_the_option_count_as_proportional(runs, monkeypatch):
+    monkeypatch.setattr(config, "FEEDBACK_POLICY", "proportional")
+    make_run(runs, "val", experiment.VAL_PHASE)       # no feedback_policy field recorded
+    assert experiment.final_guard("val")["val_run"] == "val"
+    monkeypatch.setattr(config, "FEEDBACK_POLICY", "center")
+    with pytest.raises(RuntimeError, match="feedback policy"):
+        experiment.final_guard("val")

@@ -41,7 +41,8 @@ def pick_best(attempts: list[dict]) -> dict | None:
 
 def run_candidate(video_id: str, ratio: float, group: str, params: dict,
                   feature: dict, meta: dict, run_dir: Path,
-                  initial_kbps: int | None = None, reasons=(), policy: str = "proportional") -> dict:
+                  initial_kbps: int | None = None, reasons=(), policy: str | None = None) -> dict:
+    policy = policy or config.FEEDBACK_POLICY
     started = time.perf_counter()
     bud0 = budget(meta, ratio)
     kbps = int(initial_kbps or bud0["video_kbps"])

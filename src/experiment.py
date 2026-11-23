@@ -132,6 +132,7 @@ def write_run_config(run_dir: Path, phase: str, extra: dict | None = None) -> di
         "python": sys.version, "packages": packages,
         "decide_sha256": _sha(config.ROOT / "src" / "decide.py"),
         "code_sha256": code_sha256(), "rules_sha256": rules_sha256(),
+        "feedback_policy": config.FEEDBACK_POLICY,
         "dataset_root": str(config.RAW_DIR), "dataset_sha256_valid": bool(valid),
         "dataset_sha256": sources,
     }
@@ -566,6 +567,10 @@ def final_guard(val_run: str) -> dict:
         raise RuntimeError(f"{val_run} is not a VAL run (phase={recorded.get('phase')!r})")
     if not recorded.get("dataset_sha256_valid"):
         raise RuntimeError(f"{val_run} was run on a dataset that did not match its metadata hashes")
+    recorded_policy = recorded.get("feedback_policy", "proportional")  # runs before the option existed
+    if recorded_policy != config.FEEDBACK_POLICY:
+        raise RuntimeError(f"feedback policy is {config.FEEDBACK_POLICY!r} but VAL run {val_run} used "
+                           f"{recorded_policy!r}; the TEST pass must use the same rule")
     frozen = {"val_run": val_run, "rules_sha256": rules_sha256(), "code_sha256": code_sha256()}
     for key in ("rules_sha256", "code_sha256"):
         if recorded.get(key) != frozen[key]:

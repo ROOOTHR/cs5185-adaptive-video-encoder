@@ -18,6 +18,9 @@ RATIOS = (0.05, 0.02)
 MAX_ATTEMPTS = 4
 MAX_ADJUST = 0.30
 ENCODE_THREADS = 4
+# Feedback rule for the size-retry loop: proportional (default), center or secant.
+# Override with the CS5185_FEEDBACK_POLICY environment variable or `run.py --feedback-policy`.
+FEEDBACK_POLICY = os.environ.get("CS5185_FEEDBACK_POLICY", "proportional")
 
 DEV_IDS = ("01_FourPeople", "02_Beauty", "03_Bosphorus", "04_HoneyBee",
            "07_Mobcal", "08_Shields")
