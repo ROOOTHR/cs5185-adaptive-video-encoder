@@ -56,6 +56,33 @@ def _sha(path: Path) -> str:
     return digest.hexdigest()
 
 
+# Files whose content decides what gets encoded and how it is scored. Orchestration
+# (experiment.py) and reporting (report.py) are deliberately left out so reports can
+# still be improved after the rules are frozen.
+FREEZE_CODE_FILES = ("config.py", "decide.py", "encode.py", "evaluate.py", "features.py",
+                     "metadata.py", "ms_ssim.py", "pipeline.py")
+RULES_PATH = config.ROOT / "src" / "rules_v2.json"
+FINAL_PHASE = "frozen final experiment"
+VAL_PHASE = "VAL rule generalization check"
+
+
+def _normalized_bytes(path: Path) -> bytes:
+    """File bytes with CRLF folded to LF, so a Windows checkout hashes like a Linux one."""
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
+def rules_sha256() -> str:
+    return hashlib.sha256(_normalized_bytes(RULES_PATH) if RULES_PATH.is_file() else b"").hexdigest()
+
+
+def code_sha256() -> str:
+    digest = hashlib.sha256()
+    for name in FREEZE_CODE_FILES:
+        digest.update(name.encode())
+        digest.update(_normalized_bytes(config.ROOT / "src" / name))
+    return digest.hexdigest()
+
+
 def _git(*args: str, check=True) -> str:
     return _run(["git", "-C", str(config.ROOT), *args], check=check)
 
@@ -71,7 +98,7 @@ def create_run(run_name: str) -> Path:
     return path
 
 
-def write_run_config(run_dir: Path, phase: str) -> dict:
+def write_run_config(run_dir: Path, phase: str, extra: dict | None = None) -> dict:
     ffmpeg = _exe("ffmpeg")
     ffmpeg_version = _run([ffmpeg, "-version"]).splitlines()[0]
     status = _git("status", "--porcelain", "--untracked-files=normal").splitlines()
@@ -104,9 +131,12 @@ def write_run_config(run_dir: Path, phase: str) -> dict:
         "parallelism": 1, "caching_policy": "OS filesystem cache defaults; no application-level cache",
         "python": sys.version, "packages": packages,
         "decide_sha256": _sha(config.ROOT / "src" / "decide.py"),
+        "code_sha256": code_sha256(), "rules_sha256": rules_sha256(),
         "dataset_root": str(config.RAW_DIR), "dataset_sha256_valid": bool(valid),
         "dataset_sha256": sources,
     }
+    if extra:
+        record.update(extra)
     (run_dir / "run_config.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
     if not valid:
         raise ValueError("one or more dataset video hashes do not match the supplied metadata")
@@ -385,7 +415,8 @@ def derive(run_name: str) -> dict:
     rules_path.write_text(json.dumps({"pre_registered": {
         "metric": "delta_ms_ssim_db", "significance_ms_ssim_db": SIGNIFICANCE_MSSSIM_DB,
         "minimum_delta_psnr_y_db": SIGNIFICANCE_PSNR_DB, "features": list(PRE_REGISTERED_FEATURES),
-        "max_rules": MAX_RULES}, "rules": rules}, indent=2, ensure_ascii=False), encoding="utf-8")
+        "max_rules": MAX_RULES}, "source_sweep_run": run_name, "rules": rules},
+        indent=2, ensure_ascii=False), encoding="utf-8")
     _write_csv(run_dir / "rules.csv", rules)
     oracle_rows = []
     by_pair = {}
@@ -492,7 +523,7 @@ def _load_rules(path: Path | None = None) -> list[dict]:
 
 def validate(run_name: str, rules_path: Path | None = None) -> Path:
     run_dir = create_run(run_name)
-    write_run_config(run_dir, "VAL rule generalization check")
+    write_run_config(run_dir, VAL_PHASE)
     rule_list = _load_rules(rules_path)
     feature_map = extract_features(config.VAL_IDS, run_dir)
     rows = []
@@ -519,22 +550,41 @@ def validate(run_name: str, rules_path: Path | None = None) -> Path:
     return run_dir
 
 
-def final_guard() -> None:
-    tag = _git("rev-parse", "--verify", "refs/tags/frozen-v2^{commit}", check=False)
-    if not tag:
-        raise RuntimeError("final requires the frozen-v2 tag")
-    if tag != _git("rev-parse", "HEAD"):
-        raise RuntimeError("final requires HEAD to be exactly the frozen-v2 commit")
-    status = _git("status", "--porcelain", "--untracked-files=all").splitlines()
-    if status:
-        raise RuntimeError("final requires a clean worktree: " + "; ".join(status))
+def final_guard(val_run: str) -> dict:
+    """Freeze check for the one-shot TEST pass; no git tag involved.
+
+    The rules and the code that selects and scores encodes are frozen by the VAL run:
+    validate() records their hashes, and final() refuses to start unless the current
+    files still hash the same, and no completed final run exists for that frozen state.
+    """
+    val_dir = config.RUN_DIR / val_run
+    config_path, check_path = val_dir / "run_config.json", val_dir / "val_check.csv"
+    if not config_path.is_file() or not check_path.is_file():
+        raise RuntimeError(f"final requires a completed VAL run (run `validate --run {val_run}` first)")
+    recorded = json.loads(config_path.read_text(encoding="utf-8"))
+    if recorded.get("phase") != VAL_PHASE:
+        raise RuntimeError(f"{val_run} is not a VAL run (phase={recorded.get('phase')!r})")
+    if not recorded.get("dataset_sha256_valid"):
+        raise RuntimeError(f"{val_run} was run on a dataset that did not match its metadata hashes")
+    frozen = {"val_run": val_run, "rules_sha256": rules_sha256(), "code_sha256": code_sha256()}
+    for key in ("rules_sha256", "code_sha256"):
+        if recorded.get(key) != frozen[key]:
+            raise RuntimeError(f"{key.split('_')[0]} changed after the VAL run {val_run}; "
+                               "re-run `validate` so the TEST pass uses exactly what VAL checked")
+    for other in sorted(config.RUN_DIR.glob("*/run_config.json")):
+        done = json.loads(other.read_text(encoding="utf-8"))
+        if (done.get("phase") == FINAL_PHASE and done.get("rules_sha256") == frozen["rules_sha256"]
+                and done.get("code_sha256") == frozen["code_sha256"]
+                and (other.parent / "summary.csv").is_file()):
+            raise RuntimeError(f"TEST was already run once for this frozen rule set: {other.parent.name}")
+    return frozen
 
 
-def final(run_name: str = "final_v2") -> Path:
-    final_guard()
+def final(run_name: str, val_run: str) -> Path:
+    frozen = final_guard(val_run)
     phase_started = time.perf_counter()
     run_dir = create_run(run_name)
-    write_run_config(run_dir, "frozen final experiment")
+    write_run_config(run_dir, FINAL_PHASE, extra={"freeze": frozen})
     rule_list = _load_rules()
     feature_map = extract_features(config.ALL_IDS, run_dir)
     rows = []
@@ -566,12 +616,36 @@ def final(run_name: str = "final_v2") -> Path:
     _index(run_dir, f"{run_name}: frozen final experiment")
     return run_dir
 
+MSSSIM_HINT = ("pytorch-msssim reference not found. Create a venv with CPU torch + pytorch-msssim "
+               "(see requirements-align.txt) and point CS5185_MSSSIM_PYTHON at its python, "
+               "or place it at <repo parent>/_venv_msssim.")
 
-def alignment_check(sweep_run: str) -> Path:
+
+def _msssim_python() -> Path | None:
+    """Interpreter that has torch + pytorch-msssim, or None (the alignment check is optional)."""
+    override = os.environ.get("CS5185_MSSSIM_PYTHON")
+    if override:
+        return Path(override) if Path(override).is_file() else None
+    scripts = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+    venv_python = config.ROOT.parent / "_venv_msssim" / scripts
+    if venv_python.is_file():
+        return venv_python
+    import importlib.util
+    if importlib.util.find_spec("torch") and importlib.util.find_spec("pytorch_msssim"):
+        return Path(sys.executable)
+    return None
+
+
+def alignment_check(sweep_run: str, output_root: Path | None = None) -> Path:
     source_run = config.RUN_DIR / sweep_run
     if not (source_run / "sweep_summary.csv").is_file():
         raise FileNotFoundError(source_run / "sweep_summary.csv")
-    check_dir = config.CHECK_DIR / "msssim_alignment"
+    output_root = output_root or (source_run / "checks")
+    output_root.mkdir(parents=True, exist_ok=True)
+    check_dir = output_root / "msssim_alignment"
+    python = _msssim_python()
+    if python is None:
+        raise RuntimeError(MSSSIM_HINT)
     check_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(5185)
     selected = [("01_FourPeople", 0.05), ("02_Beauty", 0.05), ("03_Bosphorus", 0.05)]
@@ -602,7 +676,6 @@ def alignment_check(sweep_run: str) -> Path:
         np.savez(npz, reference=np.stack(original), distorted=np.stack(encoded))
         torch_result = check_dir / f"{vid}_torch.json"
         helper = config.ROOT / "tools" / "msssim_reference.py"
-        python = Path(r"D:\gcg\Multimedia\project\_venv_msssim\Scripts\python.exe")
         _run([str(python), str(helper), str(npz), str(torch_result)])
         reference_result = json.loads(torch_result.read_text(encoding="utf-8"))
         for idx, ours_value, reference_value in zip(indices, ours, reference_result["values"]):
@@ -611,10 +684,10 @@ def alignment_check(sweep_run: str) -> Path:
                 "absolute_difference": abs(ours_value - reference_value),
                 "torch_version": reference_result["torch"],
                 "pytorch_msssim_version": reference_result["pytorch_msssim"]})
-    alignment_path = config.CHECK_DIR / "msssim_alignment.csv"
+    alignment_path = output_root / "msssim_alignment.csv"
     _write_csv(alignment_path, alignment_rows)
     max_difference = max(row["absolute_difference"] for row in alignment_rows)
-    (config.CHECK_DIR / "msssim_alignment_basic.json").write_text(json.dumps({
+    (output_root / "msssim_alignment_basic.json").write_text(json.dumps({
         "self_comparison": self_score, "noise_levels": [1, 2, 5, 10],
         "noise_scores": [1.0] + noisy_scores,
         "strictly_monotonic_decrease": strictly_monotonic,
@@ -626,9 +699,12 @@ def alignment_check(sweep_run: str) -> Path:
     return alignment_path
 
 
-def over_target_check() -> Path:
-    check_root = config.CHECK_DIR / "over_target_retry_v3"
-    check_root.mkdir(parents=True, exist_ok=True)
+def over_target_check(run_name: str) -> Path:
+    """E3 check: force an over-target first pass and confirm the retry. Kept out of formal runs."""
+    check_root = config.CHECK_DIR / run_name
+    if check_root.exists():
+        raise FileExistsError(f"check directory already exists; use a new name: {check_root}")
+    check_root.mkdir(parents=True)
     vid, ratio = config.DEV_IDS[0], 0.05
     meta = meta_mod.load_meta(vid)
     feat = features.extract(config.RAW_DIR / meta["file"])
@@ -660,3 +736,36 @@ def over_target_check() -> Path:
     if not triggered:
         raise RuntimeError("E3 check did not produce an over-target first pass; see check CSV")
     return check_root / "over_target_retry.csv"
+
+
+def run_all(prefix: str) -> Path:
+    """Whole pipeline in order: features -> DEV sweep -> rules -> (align) -> VAL -> freeze -> TEST -> report.
+
+    Every stage gets its own run directory named <prefix>_<stage>; nothing existing is overwritten.
+    The freeze is implicit: `final` only starts if rules and selection code still match what VAL checked.
+    """
+    from . import report as report_module
+    names = {stage: f"{prefix}_{stage}" for stage in ("features", "sweep", "val", "final", "retry")}
+    for name in names.values():
+        if (config.RUN_DIR / name).exists() or (config.CHECK_DIR / name).exists():
+            raise FileExistsError(f"{name} already exists; choose a different prefix")
+    print(f"[1/8] retry check -> {names['retry']}", flush=True)
+    over_target_check(names["retry"])
+    print("[2/8] features", flush=True)
+    run_features(names["features"])
+    print("[3/8] DEV sweep", flush=True)
+    sweep(names["sweep"])
+    print("[4/8] derive rules (DEV only)", flush=True)
+    derive(names["sweep"])
+    print("[5/8] MS-SSIM alignment", flush=True)
+    if _msssim_python() is None:
+        print("      skipped: " + MSSSIM_HINT, flush=True)
+    else:
+        alignment_check(names["sweep"])
+    print("[6/8] VAL check", flush=True)
+    validate(names["val"])
+    print("[7/8] TEST (frozen, once)", flush=True)
+    run_dir = final(names["final"], names["val"])
+    print("[8/8] report", flush=True)
+    report_module.generate(names["final"])
+    return run_dir

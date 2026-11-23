@@ -1,0 +1,8 @@
+# Optional: independent MS-SSIM reference used only by `run.py align-check` (and the align step of `all`).
+# Install into a separate venv so torch stays out of the main environment, e.g.
+#   py -3.12 -m venv ..\_venv_msssim
+#   ..\_venv_msssim\Scripts\pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   ..\_venv_msssim\Scripts\pip install -r requirements-align.txt
+# run.py finds ..\_venv_msssim automatically, or set CS5185_MSSSIM_PYTHON to that interpreter.
+numpy
+pytorch-msssim==1.0.0

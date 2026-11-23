@@ -18,13 +18,17 @@ def main():
     derive.add_argument("--run", required=True, help="sweep run containing sweep_summary.csv")
     validate = commands.add_parser("validate", help="check frozen rules on VAL only")
     validate.add_argument("--run", required=True)
-    final = commands.add_parser("final", help="run one frozen test pass; requires clean frozen-v2 tag")
-    final.add_argument("--run", default="final_v2")
+    final = commands.add_parser("final", help="run the one-shot TEST pass; needs a completed VAL run with unchanged rules/code")
+    final.add_argument("--run", required=True)
+    final.add_argument("--val", required=True, help="VAL run that froze the rules")
     align = commands.add_parser("align-check", help="compare custom MS-SSIM against pytorch-msssim")
     align.add_argument("--run", required=True, help="completed DEV sweep run")
     checks = commands.add_parser("check-retry", help="trigger the isolated E3 over-target retry")
+    checks.add_argument("--run", required=True, help="new directory name under results/checks/")
+    everything = commands.add_parser("all", help="run the whole pipeline from features to report")
+    everything.add_argument("--prefix", required=True, help="stages are written to <prefix>_features/_sweep/_val/_final")
     report = commands.add_parser("report", help="build figures and TEST subjective materials")
-    report.add_argument("--run", default="final_v2")
+    report.add_argument("--run", required=True, help="final run to build the report for")
     args = parser.parse_args()
 
     try:
@@ -34,16 +38,18 @@ def main():
             path = experiment.sweep(args.run)
         elif args.command == "derive":
             result = experiment.derive(args.run)
-            print(f"Frozen-rule source written: {result['path']} ({len(result['rules'])} rules)")
+            print(f"Rules written: {result['path']} ({len(result['rules'])} rules)")
             path = config.RUN_DIR / args.run
         elif args.command == "validate":
             path = experiment.validate(args.run)
         elif args.command == "final":
-            path = experiment.final(args.run)
+            path = experiment.final(args.run, args.val)
         elif args.command == "align-check":
             path = experiment.alignment_check(args.run)
         elif args.command == "check-retry":
-            path = experiment.over_target_check()
+            path = experiment.over_target_check(args.run)
+        elif args.command == "all":
+            path = experiment.run_all(args.prefix)
         else:
             from src import report as report_module
             path = report_module.generate(args.run)

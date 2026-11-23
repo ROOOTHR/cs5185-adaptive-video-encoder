@@ -26,15 +26,12 @@ python run.py align-check --run sweep_v2
 python run.py derive --run sweep_v2
 python -m pytest -q tests/test_decide.py
 python run.py validate --run val_v2
-# 历史正式运行在干净的 frozen-v2 提交；独立复现应在该 tag 执行 final，不要移动 tag
-# （远程没有该 tag：git tag frozen-v2 55516859a134dfbdf64a5811a33ed9a344fb9820 && git checkout frozen-v2）
-python run.py final --run final_v2
-# 生成展示材料时回到 v2 分支，使用其报告器
-git checkout v2
+# 新版：final 由 VAL run 记录的规则/代码哈希把关，不再依赖 git 标签（见 README 的“冻结”一节）
+python run.py final --run final_v2 --val val_v2
 python run.py report --run final_v2
 ```
 
-TEST 只在冻结 tag 后运行一次。重现时请为已存在的 run 目录选择新名称，程序不会覆盖已有目录。数据集哈希验证在 final run_config 中为通过；不使用仓库旧 `data/raw/`。v1 日志只作归档，不进入 v2 规则。
+TEST 只在规则冻结后运行一次。重现时请为已存在的 run 目录选择新名称，程序不会覆盖已有目录。数据集哈希验证在 final run_config 中为通过；不使用仓库旧 `data/raw/`。v1 日志只作归档，不进入 v2 规则。
 
 ## 3. MS-SSIM 与对齐校验
 
@@ -49,8 +46,8 @@ TEST 只在冻结 tag 后运行一次。重现时请为已存在的 run 目录�
 - DEV：01、02、03、04、07、08，仅用于扫描和规则推导。
 - VAL：11、12，仅用于冻结前检查，不选参。
 - TEST：05、06、09、10，v2 final 前没有用于规则拟合；冻结后执行唯一一次 `final_v2`。
-- `sweep/derive` 只允许 DEV IDs；`final` 要求 `frozen-v2` 指向当前 HEAD 且开始时工作区干净。
-- 冻结 tag `frozen-v2` 指向 commit `55516859a134dfbdf64a5811a33ed9a344fb9820`（短 hash `5551685`）。Final 的 `run_config.json` 记录相同 commit、`git_dirty=false`、数据集哈希通过。代码分支为 `v2`，已推送到 `origin/v2`；`frozen-v2` tag 仅在本机，远程没有。
+- `sweep/derive` 只允许 DEV IDs。入库的 `final_v2` 运行时，`final` 要求 git 标签 `frozen-v2` 指向当前 HEAD 且工作区干净；该标签检查后来改为哈希检查（VAL run 记录规则与选参代码的哈希，`final` 要求未变且同一冻结状态只跑一次），标签已移除，`final_v2` 的 `run_config.json` 仍记录当时的 commit。
+- 入库的 `final_v2` 运行时，冻结 tag `frozen-v2`（现已移除）指向 commit `55516859a134dfbdf64a5811a33ed9a344fb9820`（短 hash `5551685`）。Final 的 `run_config.json` 记录相同 commit、`git_dirty=false`、数据集哈希通过。代码分支为 `v2`，已推送到 `origin/v2`；该 commit 在 `v2` 的历史中，可用 `git show 5551685` 查看。
 
 冻结后仅对 `src/report.py` 作报告修正：让未通过验收的 A 候选也生成标有诊断用途的三联帧/短片，并在 HTML 标红失败行、标注诊断短片。同时保留已有人工观察表，避免重建报告时覆盖。没有改编码器决策、参数、输入或重跑 final；因此 tag 保持在实际编码使用的冻结提交，分支最新报告提交在 tag 之后。
 
