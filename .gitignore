@@ -1,29 +1,51 @@
-# Virtual environments and caches
+# ============================================================
+# 约定：入库的是"代码 + 文档 + 可追溯的结果证据"；
+#       由程序重新生成的大文件一律不入库。详见 results/README.md
+# ============================================================
+
+# ---- Python 环境与缓存 ----
 .venv/
 .pip-cache/
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Large datasets and encoding outputs
+# ---- 编辑器 ----
+.idea/
+.vscode/
+
+# ---- 数据集与 v1 编码产物（体积大，数据集从课程发布处获取）----
 data/raw/
 data/out/
 data/out_baseline/
 data/out_v1_uncalibrated/
 
-# x264 pass logs
+# ---- 编码器副产物（x264 两遍编码的统计文件，任何位置都排除）----
 *.log
 *.log.mbtree
+*.mbtree
 x264_2pass.log*
 
-# Diagnostic temporary outputs
+# ---- 视频与大数组：默认全部排除 ----
+# 全量候选视频在 results/runs/<run>/videos/，同样被这里的规则挡住。
+*.mp4
+*.y4m
+*.yuv
+*.npz
+
+# ---- results/：保留结论与证据，排除程序可重新生成的体积项 ----
+# 按目录层级写，新跑的 run 无需再改本文件。
+results/runs/*/videos/
+results/checks/**/videos/
+# 以上之外的内容都入库：
+#   summary / comparisons / attempts.jsonl / run_config.json   可追溯记录（含输出 sha256）
+#   features/ perframe/                                        逐帧特征与逐帧指标，体积小
+#   figs/ frames/ clips/ index.html subjective_notes.csv       可视化与主观材料
+
+# ---- 诊断脚本的临时产物（_diag/*.py 保留）----
 _diag/*.mp4
 _diag/*.txt
+_diag/sw_*
 
-# Editors
-.idea/
-.vscode/
-
-# Reproducible run artifacts stay local; documentation and code are committed
-results/runs/
-results/checks/
+# ---- 不入库的过程文档（含本机绝对路径）----
 /docs/tasks/codex_v2_task.md

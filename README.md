@@ -45,6 +45,8 @@ python run.py report --run final_v2
 - TEST：A 组 7/8 通过完整体积窗口，B0/B1 均 8/8；全部 24 个 TEST 输出均未超过目标。完整逐行表见 `results/runs/final_v2/comparisons.csv`。
 - 主观材料和 HTML：`results/runs/final_v2/index.html`（16 张三联帧、8 个并排短片、观察表）。已在 Edge 核验首页渲染，138 个本地引用均存在。运动流畅度未确认，未整段播放短片。
 
+- 入库内容与目录约定（哪些结果入库、哪些由程序重新生成而被忽略）：见 [`results/README.md`](results/README.md)。
+
 ## 命令
 
 - `features --run <name>`：提取 12 视频的报告用特征，不参与规则拟合。

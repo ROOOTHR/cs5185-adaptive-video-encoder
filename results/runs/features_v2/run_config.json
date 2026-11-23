@@ -1,0 +1,99 @@
+{
+  "phase": "features",
+  "run_name": "features_v2",
+  "created_at": "2026-11-20T16:30:50+0800",
+  "git_commit": "2955e0cda0d09ae179be8a68b0f0b7aa4bacc5b4",
+  "git_dirty": false,
+  "git_status": [],
+  "ffmpeg_version": "ffmpeg version 7.1-essentials_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers",
+  "cpu": "AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD",
+  "logical_cpus": 32,
+  "encode_threads": 4,
+  "parallelism": 1,
+  "python": "3.14.7 (tags/v3.14.7:823f032, Aug  5 2026, 10:51:32) [MSC v.1944 64 bit (AMD64)]",
+  "packages": {
+    "numpy": "2.5.3",
+    "opencv-python": null,
+    "matplotlib": "3.11.2",
+    "imageio-ffmpeg": "0.6.0",
+    "torch": "2.14.1",
+    "pytorch-msssim": null
+  },
+  "decide_sha256": "a663e74a0a3a8fe5fd7a5bc26c976cc38d37b9d427565fc80f83076649ac467b",
+  "dataset_root": "D:\\gcg\\Multimedia\\project\\CS5185_Project_Video_Dataset",
+  "dataset_sha256_valid": true,
+  "dataset_sha256": {
+    "01_FourPeople": {
+      "video_sha256": "274dc6717af23204f7741727558cdf781d07f031aeaa0fa3cac597033d4b71c9",
+      "metadata_sha256": "7a0bef47c4fa9f26ae07208eb5a7c706b11e7e8ad670ed32e754078d1a30b1e2",
+      "expected_video_sha256": "274dc6717af23204f7741727558cdf781d07f031aeaa0fa3cac597033d4b71c9",
+      "matches_metadata": true
+    },
+    "02_Beauty": {
+      "video_sha256": "54a4e24135ec8b3b82e94b2d7873a323f470b019ae7e8a57293602a2e65f1c0f",
+      "metadata_sha256": "da058fe7135181666b73f4fd283c80b1b22d8c0aafa3c51ac6faca99e47a994c",
+      "expected_video_sha256": "54a4e24135ec8b3b82e94b2d7873a323f470b019ae7e8a57293602a2e65f1c0f",
+      "matches_metadata": true
+    },
+    "03_Bosphorus": {
+      "video_sha256": "866e9f039f6840c413421c6071f3196aac021d519f9902aaad030a1eb34344ad",
+      "metadata_sha256": "97ad91306d13c4b2f1f0de33180e71a54a7d3abea148208478385b482a3df2f9",
+      "expected_video_sha256": "866e9f039f6840c413421c6071f3196aac021d519f9902aaad030a1eb34344ad",
+      "matches_metadata": true
+    },
+    "04_HoneyBee": {
+      "video_sha256": "6002dbdccea6033de3294ac1bfa04d1305e81e7d6381bef87006517ad1c7f353",
+      "metadata_sha256": "4b6f5d4087472b06220b23e118b73d488025f2c9b6b2dacc22220ada9239c327",
+      "expected_video_sha256": "6002dbdccea6033de3294ac1bfa04d1305e81e7d6381bef87006517ad1c7f353",
+      "matches_metadata": true
+    },
+    "05_Jockey": {
+      "video_sha256": "ea53c006e9361daa918aaee2a2113402c3c148fa44ead1ff1d62d92c9e1d1ca6",
+      "metadata_sha256": "9597664d948bb90466d7b2f5d7845d767a95fc420b7a272cfa4261840f22d9b5",
+      "expected_video_sha256": "ea53c006e9361daa918aaee2a2113402c3c148fa44ead1ff1d62d92c9e1d1ca6",
+      "matches_metadata": true
+    },
+    "06_ShakeNDry": {
+      "video_sha256": "1b105f318e5061e585a0235fa7f9600cb926fc576cf96fd3f9eaa2bc59f85512",
+      "metadata_sha256": "41d68b103ff819df16beda4ee5aeff1f67739ca44914566a70b6fdf495c66747",
+      "expected_video_sha256": "1b105f318e5061e585a0235fa7f9600cb926fc576cf96fd3f9eaa2bc59f85512",
+      "matches_metadata": true
+    },
+    "07_Mobcal": {
+      "video_sha256": "b6899426199fa7f7dfe23e4fa20cc00bd34b0849aa1c22cd5c24cd423aa1b96d",
+      "metadata_sha256": "aa644359fed2784cae4f9098a1e501e2d70a933e9df956736c5ee49501cbe847",
+      "expected_video_sha256": "b6899426199fa7f7dfe23e4fa20cc00bd34b0849aa1c22cd5c24cd423aa1b96d",
+      "matches_metadata": true
+    },
+    "08_Shields": {
+      "video_sha256": "7356726c9e92a945d522f1def0278588d3746f19904c17a7d977be3f1d4eb0a7",
+      "metadata_sha256": "91eaf44e6e5e0767046004f212d197ff4c3ea0cd392b6c0ddb7557180faa7a0e",
+      "expected_video_sha256": "7356726c9e92a945d522f1def0278588d3746f19904c17a7d977be3f1d4eb0a7",
+      "matches_metadata": true
+    },
+    "09_Parkrun": {
+      "video_sha256": "2ddef466641098d4d20e7d67a890ac2842ab92bbe2b8df3de1266210d4b6b921",
+      "metadata_sha256": "6f0f5e7384833e6e8dc79567662469238a71b33a32fcdcf79428115e52558bc1",
+      "expected_video_sha256": "2ddef466641098d4d20e7d67a890ac2842ab92bbe2b8df3de1266210d4b6b921",
+      "matches_metadata": true
+    },
+    "10_Stockholm": {
+      "video_sha256": "706bd0e317ab0db0a54bfab1cf24f683c8eb7e1acb8b4e40e0e4f1f630f29fe0",
+      "metadata_sha256": "a8a105d8b58c0ba49602265e2c8b5b6bde6b35c85c1a0d0b5aa24666911fe535",
+      "expected_video_sha256": "706bd0e317ab0db0a54bfab1cf24f683c8eb7e1acb8b4e40e0e4f1f630f29fe0",
+      "matches_metadata": true
+    },
+    "11_Sintel": {
+      "video_sha256": "c6a983f1144fc0a49b89df8a109ff02245f1fc58450b56412a590c71a1b1177e",
+      "metadata_sha256": "bab3092611bc07872d570ed5e4be375a13120569fdaebd8e5d7b76fc43477650",
+      "expected_video_sha256": "c6a983f1144fc0a49b89df8a109ff02245f1fc58450b56412a590c71a1b1177e",
+      "matches_metadata": true
+    },
+    "12_ControlledBurn": {
+      "video_sha256": "87604fd72523b625c06b0dee60b6314e05e5f57825f7db841a840b0f286985d5",
+      "metadata_sha256": "37945f2822a0b50a255dae8144b85203a16a1892126aceccce358f01ae0b0581",
+      "expected_video_sha256": "87604fd72523b625c06b0dee60b6314e05e5f57825f7db841a840b0f286985d5",
+      "matches_metadata": true
+    }
+  }
+}

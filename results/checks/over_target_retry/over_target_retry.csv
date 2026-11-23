@@ -1,0 +1,5 @@
+﻿video_id,ratio,initial_multiplier,initial_kbps,first_actual_bytes,first_size_error,first_next_action,retry_triggered,attempt_count,final_status
+01_FourPeople,0.05,1.15,5762,,,stop,False,1,failed
+01_FourPeople,0.05,1.3,6513,,,stop,False,1,failed
+01_FourPeople,0.05,1.6,8016,,,stop,False,1,failed
+01_FourPeople,0.05,2.0,10020,,,stop,False,1,failed
