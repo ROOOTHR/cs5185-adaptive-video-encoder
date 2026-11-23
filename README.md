@@ -61,6 +61,7 @@ python run.py report --run r1_final
 - 主观材料和 HTML：`results/runs/final_v2/index.html`（16 张三联帧、8 个并排短片、观察表）。已在 Edge 核验首页渲染，138 个本地引用均存在。运动流畅度未确认，未整段播放短片。
 
 - 入库内容与目录约定（哪些结果入库、哪些由程序重新生成而被忽略）：见 [`results/README.md`](results/README.md)。
+- 踩过的坑及 v2 的实际响应状态（预算公式、PDF 码率表错误、线程数导致的 +40% 过冲、规则表的取舍）：见 [`docs/pitfalls.md`](docs/pitfalls.md)。
 
 ## 命令
 
